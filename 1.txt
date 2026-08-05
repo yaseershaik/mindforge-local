@@ -1,0 +1,3820 @@
+src/lib/chunker.ts
+
+/**
+ * Recursive character text splitter.
+ *
+ * Splits text into overlapping chunks of approximately CHUNK_SIZE characters
+ * (≈ 500 tokens at the 4 chars/token heuristic), with OVERLAP characters of
+ * context carried over between consecutive chunks.
+ *
+ * Separator priority (highest → lowest semantic value):
+ *   \n\n  (paragraph break)
+ *   \n    (line break)
+ *   .     (sentence end)
+ *   " "   (word boundary)
+ *   ""    (hard character cut — last resort)
+ *
+ * This file is intentionally free of any React / Next.js imports so it can be
+ * safely imported inside a Web Worker context.
+ */
+
+import type { TextChunk } from "@/types";
+
+// ── Configuration ─────────────────────────────────────────────────────────
+export const CHUNK_SIZE = 2_000;   // characters ≈ 500 tokens
+export const CHUNK_OVERLAP = 200;  // characters ≈ 50 tokens
+
+const SEPARATORS = ["\n\n", "\n", ". ", " ", ""];
+
+// ── Internal helpers ──────────────────────────────────────────────────────
+
+/**
+ * Find the best split point at or before `maxEnd` in `text` using the given
+ * separator. Returns the split index (inclusive end of the first segment) or
+ * -1 if not found.
+ */
+function findSplitPoint(
+  text: string,
+  start: number,
+  maxEnd: number,
+  separator: string
+): number {
+  if (separator === "") return maxEnd; // hard cut
+  const searchEnd = Math.min(maxEnd, text.length);
+  const sub = text.slice(start, searchEnd);
+  const idx = sub.lastIndexOf(separator);
+  if (idx === -1) return -1;
+  return start + idx + separator.length; // exclusive end (next chunk starts here)
+}
+
+/**
+ * Split a continuous text string into overlapping TextChunk records.
+ */
+export function chunkText(docId: string, text: string, docName?: string): TextChunk[] {
+  if (!text || text.trim().length === 0) return [];
+
+  const chunks: TextChunk[] = [];
+  let cursor = 0;
+
+  while (cursor < text.length) {
+    const tentativeEnd = cursor + CHUNK_SIZE;
+
+    // If the remaining text fits within one chunk, grab it all
+    if (tentativeEnd >= text.length) {
+      const raw = text.slice(cursor);
+      if (raw.trim().length > 0) {
+        chunks.push(makeChunk(docId, chunks.length, raw, cursor, text.length, docName));
+      }
+      break;
+    }
+
+    // Try each separator in priority order
+    let splitAt = -1;
+    for (const sep of SEPARATORS) {
+      splitAt = findSplitPoint(text, cursor, tentativeEnd, sep);
+      if (splitAt !== -1 && splitAt > cursor) break;
+    }
+
+    // Fallback to hard cut if nothing worked
+    if (splitAt <= cursor) splitAt = tentativeEnd;
+
+    const raw = text.slice(cursor, splitAt);
+    if (raw.trim().length > 0) {
+      chunks.push(makeChunk(docId, chunks.length, raw, cursor, splitAt, docName));
+    }
+
+    // Advance with overlap
+    cursor = Math.max(splitAt - CHUNK_OVERLAP, cursor + 1);
+  }
+
+  return chunks;
+}
+
+function makeChunk(
+  docId: string,
+  index: number,
+  text: string,
+  startChar: number,
+  endChar: number,
+  docName?: string
+): TextChunk {
+  return {
+    id: `${docId}-${index}`,
+    docId,
+    docName,
+    index,
+    text: text.trim(),
+    startChar,
+    endChar,
+    tokenEstimate: Math.ceil(text.length / 4),
+  };
+}
+
+src/lib/embedWorkerPool.ts
+
+/**
+ * embedWorkerPool.ts
+ *
+ * Singleton manager for embed.worker.ts.
+ */
+
+import type { TextChunk, EmbedWorkerOutMessage, EmbedWorkerTask } from "@/types";
+
+type EmbedJobHandler = (msg: EmbedWorkerOutMessage) => void;
+
+class EmbedWorkerPool {
+  private worker: Worker;
+  private handlers = new Map<string, EmbedJobHandler>();
+
+  constructor() {
+    this.worker = new Worker(
+      new URL("../workers/embed.worker.ts", import.meta.url),
+      { type: "module" }
+    );
+
+    this.worker.addEventListener("message", (event: MessageEvent<EmbedWorkerOutMessage>) => {
+      const msg = event.data;
+      const handler = this.handlers.get(msg.jobId);
+      if (handler) {
+        handler(msg);
+        if (msg.type === "embed-done" || msg.type === "embed-error") {
+          this.handlers.delete(msg.jobId);
+        }
+      }
+    });
+
+    this.worker.addEventListener("error", (event) => {
+      console.error("[EmbedWorkerPool] Uncaught worker error:", event.message);
+    });
+  }
+
+  enqueue(
+    jobId: string,
+    docId: string,
+    chunks: TextChunk[],
+    handler: EmbedJobHandler
+  ): void {
+    this.handlers.set(jobId, handler);
+    const task: EmbedWorkerTask = {
+      type: "embed",
+      jobId,
+      docId,
+      chunks,
+    };
+    this.worker.postMessage(task);
+  }
+
+  terminate(): void {
+    this.worker.terminate();
+    this.handlers.clear();
+  }
+}
+
+let instance: EmbedWorkerPool | null = null;
+
+export function getEmbedWorkerPool(): EmbedWorkerPool | null {
+  if (typeof window === "undefined") return null;
+  if (!instance) instance = new EmbedWorkerPool();
+  return instance;
+}
+
+export function terminateEmbedWorkerPool(): void {
+  instance?.terminate();
+  instance = null;
+}
+
+src/lib/graphBuilder.ts
+
+/**
+ * graphBuilder.ts
+ *
+ * Constructs 3D Knowledge Graph node & edge data structures from ingested documents
+ * and text chunks. Computes cross-document vector similarity edges (>0.75 threshold).
+ */
+
+import type { DocumentMeta, TextChunk } from "@/types";
+
+export interface Graph3DNode {
+  id: string;
+  name: string;
+  type: "document" | "concept";
+  color: string;
+  val: number;
+  docId: string;
+  docName?: string;
+  chunkIndex?: number;
+  chunkText?: string;
+  tokenEstimate?: number;
+  x?: number;
+  y?: number;
+  z?: number;
+}
+
+export interface Graph3DLink {
+  source: string;
+  target: string;
+  type: "parent" | "similarity";
+  color: string;
+  similarity?: number;
+  curvature?: number;
+}
+
+export interface Graph3DData {
+  nodes: Graph3DNode[];
+  links: Graph3DLink[];
+}
+
+/**
+ * Computes cosine similarity between two normalized 384-dim vectors (dot product)
+ */
+export function computeCosineSimilarity(vecA: number[], vecB: number[]): number {
+  if (vecA.length !== vecB.length) return 0;
+  let dot = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    dot += vecA[i] * vecB[i];
+  }
+  return dot;
+}
+
+/**
+ * Builds 3D Knowledge Graph nodes and cross-document similarity links (>0.75 score threshold).
+ */
+export function build3DKnowledgeGraph(
+  documents: DocumentMeta[],
+  allChunks: TextChunk[],
+  similarityThreshold = 0.75
+): Graph3DData {
+  const nodes: Graph3DNode[] = [];
+  const links: Graph3DLink[] = [];
+  const docMap = new Map<string, DocumentMeta>();
+
+  // 1. Primary Document Nodes (Cyan #22d3ee)
+  documents.forEach((doc) => {
+    docMap.set(doc.id, doc);
+    nodes.push({
+      id: `doc-${doc.id}`,
+      name: doc.name,
+      type: "document",
+      color: "#22d3ee",
+      val: 14,
+      docId: doc.id,
+      docName: doc.name,
+    });
+  });
+
+  // 2. Secondary Concept / Chunk Nodes (Purple #a855f7)
+  const embeddedChunks: TextChunk[] = [];
+
+  allChunks.forEach((chunk) => {
+    const parentDoc = docMap.get(chunk.docId);
+    const shortLabel =
+      chunk.text.length > 45 ? `${chunk.text.slice(0, 45)}…` : chunk.text;
+
+    nodes.push({
+      id: `chunk-${chunk.id}`,
+      name: `Chunk #${chunk.index + 1}: ${shortLabel}`,
+      type: "concept",
+      color: "#a855f7",
+      val: 6,
+      docId: chunk.docId,
+      docName: chunk.docName || parentDoc?.name || "Document",
+      chunkIndex: chunk.index,
+      chunkText: chunk.text,
+      tokenEstimate: chunk.tokenEstimate,
+    });
+
+    // Parent structural edge (Cyan tint)
+    links.push({
+      source: `doc-${chunk.docId}`,
+      target: `chunk-${chunk.id}`,
+      type: "parent",
+      color: "rgba(34, 211, 238, 0.25)",
+    });
+
+    if (Array.isArray(chunk.embedding) && chunk.embedding.length === 384) {
+      embeddedChunks.push(chunk);
+    }
+  });
+
+  // 3. Cross-Document Similarity Edges (Cosine similarity > 0.75)
+  for (let i = 0; i < embeddedChunks.length; i++) {
+    for (let j = i + 1; j < embeddedChunks.length; j++) {
+      const cA = embeddedChunks[i];
+      const cB = embeddedChunks[j];
+
+      // Only link concepts belonging to DIFFERENT documents
+      if (cA.docId !== cB.docId) {
+        const sim = computeCosineSimilarity(cA.embedding!, cB.embedding!);
+        if (sim >= similarityThreshold) {
+          links.push({
+            source: `chunk-${cA.id}`,
+            target: `chunk-${cB.id}`,
+            type: "similarity",
+            color: "#818cf8", // Electric Indigo glow
+            similarity: sim,
+            curvature: 0.2,
+          });
+        }
+      }
+    }
+  }
+
+  return { nodes, links };
+}
+
+src/lib/vectorStore.ts
+
+/**
+ * vectorStore.ts
+ *
+ * In-browser vector database powered by @orama/orama.
+ * Persists vector embeddings and document metadata to IndexedDB for air-gapped offline storage.
+ */
+
+import { create, insertMultiple, search, count, save, load, removeMultiple, type AnyOrama } from "@orama/orama";
+import type { TextChunk, DocumentMeta, VectorSearchResult } from "@/types";
+
+const DB_NAME = "mindforge_vector_db";
+const DB_VERSION = 1;
+const STORE_ORAMA = "orama_snapshot";
+const STORE_DOCS = "documents_meta";
+
+let dbInstance: AnyOrama | null = null;
+let listeners: Array<() => void> = [];
+
+// ── IndexedDB Helpers ──────────────────────────────────────────────────────
+
+function openIDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof window === "undefined" || !window.indexedDB) {
+      return reject(new Error("IndexedDB is not available in this environment"));
+    }
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onupgradeneeded = (e) => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(STORE_ORAMA)) {
+        db.createObjectStore(STORE_ORAMA);
+      }
+      if (!db.objectStoreNames.contains(STORE_DOCS)) {
+        db.createObjectStore(STORE_DOCS, { keyPath: "id" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function idbGet<T>(storeName: string, key: string): Promise<T | null> {
+  try {
+    const db = await openIDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, "readonly");
+      const store = tx.objectStore(storeName);
+      const req = store.get(key);
+      req.onsuccess = () => resolve((req.result as T) ?? null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function idbSet<T>(storeName: string, key: string, value: T): Promise<void> {
+  try {
+    const db = await openIDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, "readwrite");
+      const store = tx.objectStore(storeName);
+      const req = store.put(value, key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  } catch (err) {
+    console.warn("[VectorStore] Failed to write to IndexedDB:", err);
+  }
+}
+
+async function idbSaveDocs(docs: DocumentMeta[]): Promise<void> {
+  try {
+    const db = await openIDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_DOCS, "readwrite");
+      const store = tx.objectStore(STORE_DOCS);
+      store.clear();
+      docs.forEach((doc) => store.put(doc));
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.warn("[VectorStore] Failed to save documents to IndexedDB:", err);
+  }
+}
+
+async function idbLoadDocs(): Promise<DocumentMeta[]> {
+  try {
+    const db = await openIDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_DOCS, "readonly");
+      const store = tx.objectStore(STORE_DOCS);
+      const req = store.getAll();
+      req.onsuccess = () => resolve((req.result as DocumentMeta[]) ?? []);
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return [];
+  }
+}
+
+async function idbClear(): Promise<void> {
+  try {
+    const db = await openIDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([STORE_ORAMA, STORE_DOCS], "readwrite");
+      tx.objectStore(STORE_ORAMA).clear();
+      tx.objectStore(STORE_DOCS).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.warn("[VectorStore] Failed to clear IndexedDB:", err);
+  }
+}
+
+// ── Vector DB Factory ──────────────────────────────────────────────────────
+
+async function createOramaSchema(): Promise<AnyOrama> {
+  return await create({
+    schema: {
+      id: "string",
+      docId: "string",
+      docName: "string",
+      index: "number",
+      text: "string",
+      startChar: "number",
+      endChar: "number",
+      tokenEstimate: "number",
+      embedding: "vector[384]",
+    },
+  });
+}
+
+function notifyStoreChanged() {
+  listeners.forEach((fn) => fn());
+}
+
+// ── Public API ─────────────────────────────────────────────────────────────
+
+export function subscribeVectorStore(listener: () => void): () => void {
+  listeners.push(listener);
+  return () => {
+    listeners = listeners.filter((l) => l !== listener);
+  };
+}
+
+/**
+ * Initialize vector database and restore saved snapshot from IndexedDB.
+ */
+export async function initVectorStore(): Promise<AnyOrama> {
+  if (dbInstance) return dbInstance;
+
+  dbInstance = await createOramaSchema();
+
+  const savedSnapshot = await idbGet<unknown>(STORE_ORAMA, "snapshot");
+  if (savedSnapshot) {
+    try {
+      await load(dbInstance, savedSnapshot as Parameters<typeof load>[1]);
+      console.log(`[VectorStore] Restored index from IndexedDB. Vectors: ${await count(dbInstance)}`);
+    } catch (err) {
+      console.warn("[VectorStore] Could not restore snapshot, starting fresh:", err);
+    }
+  }
+
+  notifyStoreChanged();
+  return dbInstance;
+}
+
+/**
+ * Insert document text chunks with their 384-dim embeddings into Orama index and persist snapshot.
+ */
+export async function insertDocChunks(docId: string, chunks: TextChunk[]): Promise<number> {
+  const db = await initVectorStore();
+  const validChunks = chunks.filter((c) => Array.isArray(c.embedding) && c.embedding.length === 384);
+
+  if (validChunks.length === 0) return 0;
+
+  const docsToInsert = validChunks.map((c) => ({
+    id: c.id,
+    docId: c.docId,
+    docName: c.docName || "",
+    index: c.index,
+    text: c.text,
+    startChar: c.startChar,
+    endChar: c.endChar,
+    tokenEstimate: c.tokenEstimate,
+    embedding: c.embedding!,
+  }));
+
+  await insertMultiple(db, docsToInsert);
+
+  // Persist updated snapshot
+  const snapshot = await save(db);
+  await idbSet(STORE_ORAMA, "snapshot", snapshot);
+
+  notifyStoreChanged();
+  return validChunks.length;
+}
+
+/**
+ * Remove all chunks associated with a document from the vector store.
+ */
+export async function removeDocChunks(docId: string): Promise<void> {
+  const db = await initVectorStore();
+  const searchRes = await search(db, {
+    where: { docId },
+    limit: 10000,
+  });
+
+  const idsToRemove = searchRes.hits.map((h) => h.id);
+  if (idsToRemove.length > 0) {
+    await removeMultiple(db, idsToRemove);
+    const snapshot = await save(db);
+    await idbSet(STORE_ORAMA, "snapshot", snapshot);
+  }
+
+  notifyStoreChanged();
+}
+
+/**
+ * Clear the entire vector database and IndexedDB store.
+ */
+export async function clearVectorStore(): Promise<void> {
+  await idbClear();
+  dbInstance = await createOramaSchema();
+  notifyStoreChanged();
+}
+
+/**
+ * Get total number of vector chunks indexed in Orama.
+ */
+export async function getVectorCount(): Promise<number> {
+  if (!dbInstance) {
+    if (typeof window === "undefined") return 0;
+    dbInstance = await initVectorStore();
+  }
+  return await count(dbInstance);
+}
+
+/**
+ * Search vector database using vector similarity (cosine similarity).
+ */
+export async function searchVector(
+  queryEmbedding: number[],
+  topK = 5
+): Promise<VectorSearchResult[]> {
+  const db = await initVectorStore();
+
+  const results = await search(db, {
+    mode: "vector",
+    vector: {
+      property: "embedding",
+      value: queryEmbedding,
+    },
+    similarity: 0.3,
+    limit: topK,
+  });
+
+  return results.hits.map((hit) => {
+    const document = hit.document as unknown as TextChunk;
+    return {
+      chunk: {
+        id: document.id,
+        docId: document.docId,
+        docName: document.docName || "",
+        index: document.index,
+        text: document.text,
+        startChar: document.startChar,
+        endChar: document.endChar,
+        tokenEstimate: document.tokenEstimate,
+      },
+      score: hit.score,
+    };
+  });
+}
+
+/**
+ * Persist document metadata list to IndexedDB.
+ */
+export async function savePersistedDocuments(docs: DocumentMeta[]): Promise<void> {
+  await idbSaveDocs(docs);
+}
+
+/**
+ * Load persisted document metadata list from IndexedDB.
+ */
+export async function loadPersistedDocuments(): Promise<DocumentMeta[]> {
+  return await idbLoadDocs();
+}
+
+src/lib/webLlmEngine.ts
+
+/**
+ * webLlmEngine.ts
+ *
+ * WebGPU Local LLM Inference Engine powered by @mlc-ai/web-llm.
+ * Runs 100% in-browser on WebGPU with RAG context streaming.
+ */
+
+import { CreateMLCEngine, type MLCEngine, type InitProgressReport } from "@mlc-ai/web-llm";
+import { searchVector } from "./vectorStore";
+import { getEmbedWorkerPool } from "./embedWorkerPool";
+import type { TextChunk, VectorSearchResult } from "@/types";
+
+export interface ModelSpec {
+  id: string;
+  name: string;
+  vramMB: number;
+  description: string;
+  isRecommended?: boolean;
+}
+
+export const SUPPORTED_MODELS: ModelSpec[] = [
+  {
+    id: "Llama-3.2-1B-Instruct-q4f16_1-MLC",
+    name: "Llama 3.2 1B",
+    vramMB: 879,
+    description: "Fast & lightweightMeta LLM (~879MB VRAM)",
+    isRecommended: true,
+  },
+  {
+    id: "SmolLM2-360M-Instruct-q4f16_1-MLC",
+    name: "SmolLM2 360M",
+    vramMB: 376,
+    description: "Ultra-fast lightweight model (~376MB VRAM)",
+  },
+  {
+    id: "Qwen2.5-1.5B-Instruct-q4f16_1-MLC",
+    name: "Qwen 2.5 1.5B",
+    vramMB: 1630,
+    description: "High-capability small model (~1.6GB VRAM)",
+  },
+  {
+    id: "Llama-3.1-8B-Instruct-q4f16_1-MLC-1k",
+    name: "Llama 3.1 8B",
+    vramMB: 4598,
+    description: "Full precision 8B model (~4.6GB VRAM)",
+  },
+];
+
+export type EngineStatus = "unloaded" | "loading" | "ready" | "error";
+
+export interface EngineState {
+  status: EngineStatus;
+  selectedModelId: string;
+  progress: number; // 0 to 100
+  progressText: string;
+  errorMessage: string | null;
+}
+
+let engineInstance: MLCEngine | null = null;
+let state: EngineState = {
+  status: "unloaded",
+  selectedModelId: SUPPORTED_MODELS[0].id,
+  progress: 0,
+  progressText: "",
+  errorMessage: null,
+};
+
+let listeners: Array<(s: EngineState) => void> = [];
+
+function notifyStateChange() {
+  listeners.forEach((l) => l({ ...state }));
+}
+
+export function subscribeEngineState(listener: (s: EngineState) => void): () => void {
+  listeners.push(listener);
+  listener({ ...state });
+  return () => {
+    listeners = listeners.filter((l) => l !== listener);
+  };
+}
+
+export function getEngineState(): EngineState {
+  return { ...state };
+}
+
+export async function checkWebGPUSupport(): Promise<{ supported: boolean; message: string }> {
+  if (typeof window === "undefined" || !navigator.gpu) {
+    return {
+      supported: false,
+      message: "WebGPU is not supported in this browser environment. (Chrome 113+ / Edge 113+ required)",
+    };
+  }
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      return {
+        supported: false,
+        message: "No WebGPU hardware adapter found.",
+      };
+    }
+    return { supported: true, message: "WebGPU Active" };
+  } catch (err) {
+    return {
+      supported: false,
+      message: err instanceof Error ? err.message : "Failed to initialize WebGPU adapter.",
+    };
+  }
+}
+
+export async function loadModelEngine(modelId?: string): Promise<MLCEngine> {
+  const targetModelId = modelId || state.selectedModelId;
+  state.selectedModelId = targetModelId;
+
+  if (engineInstance && state.status === "ready") {
+    return engineInstance;
+  }
+
+  state.status = "loading";
+  state.progress = 0;
+  state.progressText = "Initializing WebGPU engine…";
+  state.errorMessage = null;
+  notifyStateChange();
+
+  try {
+    const initProgressCallback = (report: InitProgressReport) => {
+      state.progress = Math.round(report.progress * 100);
+      state.progressText = report.text || "Loading model weights…";
+      notifyStateChange();
+    };
+
+    engineInstance = await CreateMLCEngine(targetModelId, {
+      initProgressCallback,
+    });
+
+    state.status = "ready";
+    state.progress = 100;
+    state.progressText = "Model ready";
+    notifyStateChange();
+
+    return engineInstance;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    state.status = "error";
+    state.errorMessage = message;
+    state.progressText = "Failed to load model";
+    notifyStateChange();
+    throw err;
+  }
+}
+
+/**
+ * Generate embedding for prompt using embedWorkerPool
+ */
+async function generatePromptEmbedding(promptText: string): Promise<number[] | null> {
+  const embedPool = getEmbedWorkerPool();
+  if (!embedPool) return null;
+
+  const tempChunk: TextChunk = {
+    id: "temp-prompt",
+    docId: "prompt",
+    index: 0,
+    text: promptText,
+    startChar: 0,
+    endChar: promptText.length,
+    tokenEstimate: Math.ceil(promptText.length / 4),
+  };
+
+  return new Promise((resolve) => {
+    embedPool.enqueue(
+      `embed-prompt-${Date.now()}`,
+      "prompt",
+      [tempChunk],
+      (msg) => {
+        if (msg.type === "embed-done" && msg.chunks[0]?.embedding) {
+          resolve(msg.chunks[0].embedding);
+        } else if (msg.type === "embed-error") {
+          resolve(null);
+        }
+      }
+    );
+  });
+}
+
+/**
+ * Perform RAG vector search + streaming token generation using WebLLM
+ */
+export async function streamRAGCompletion(
+  userPrompt: string,
+  onToken: (token: string, accumulated: string) => void
+): Promise<{ text: string; sources: VectorSearchResult[] }> {
+  // 1. Check & load model engine
+  const engine = await loadModelEngine();
+
+  // 2. Perform RAG Vector search
+  let sources: VectorSearchResult[] = [];
+  try {
+    const queryVector = await generatePromptEmbedding(userPrompt);
+    if (queryVector) {
+      sources = await searchVector(queryVector, 3);
+    }
+  } catch (err) {
+    console.warn("[WebLLMEngine] RAG vector retrieval failed, proceeding with direct completion:", err);
+  }
+
+  // 3. Format RAG Context
+  let contextBlock = "";
+  if (sources.length > 0) {
+    contextBlock = sources
+      .map((s, idx) => `[Source ${idx + 1} (${s.chunk.docName || "Document"}, Chunk #${s.chunk.index + 1})]: ${s.chunk.text}`)
+      .join("\n\n");
+  }
+
+  const systemMessage = contextBlock
+    ? `You are MindForge, a helpful air-gapped AI assistant running 100% locally in the user's browser.
+Use the following retrieved document context to answer the user's question accurately. If the context does not contain the answer, rely on your knowledge base while being concise.
+
+DOCUMENT CONTEXT:
+${contextBlock}`
+    : `You are MindForge, a helpful air-gapped AI assistant running 100% locally in the user's browser on WebGPU. Be concise, direct, and helpful.`;
+
+  const messages = [
+    { role: "system" as const, content: systemMessage },
+    { role: "user" as const, content: userPrompt },
+  ];
+
+  // 4. Stream tokens
+  const completionStream = await engine.chat.completions.create({
+    messages,
+    stream: true,
+    temperature: 0.6,
+    max_tokens: 1024,
+  });
+
+  let accumulatedText = "";
+  for await (const chunk of completionStream) {
+    const delta = chunk.choices[0]?.delta?.content || "";
+    if (delta) {
+      accumulatedText += delta;
+      onToken(delta, accumulatedText);
+    }
+  }
+
+  return { text: accumulatedText, sources };
+}
+
+src/lib/workerPool.ts
+
+/**
+ * workerPool.ts
+ *
+ * Lazy-initialised singleton that owns the ingestion Web Worker instance and
+ * routes incoming messages back to per-job callback handlers.
+ *
+ * Only ever instantiated in the browser — the `getWorkerPool()` factory
+ * guard prevents it running during SSR.
+ */
+
+import type {
+  DocumentType,
+  WorkerIngestMessage,
+  WorkerOutMessage,
+} from "@/types";
+
+// ── Types ─────────────────────────────────────────────────────────────────
+
+type JobHandler = (msg: WorkerOutMessage) => void;
+
+class WorkerPool {
+  private worker: Worker;
+  private handlers = new Map<string, JobHandler>();
+
+  constructor() {
+    // webpack resolves `new URL(...)` at compile time and emits the worker as
+    // a separate chunk. The { type: 'module' } option enables ESM in the worker.
+    this.worker = new Worker(
+      new URL("../workers/ingestion.worker.ts", import.meta.url),
+      { type: "module" }
+    );
+
+    this.worker.addEventListener("message", (event: MessageEvent<WorkerOutMessage>) => {
+      const msg = event.data;
+      const handler = this.handlers.get(msg.jobId);
+      if (handler) {
+        handler(msg);
+        // Clean up completed jobs
+        if (msg.type === "done" || msg.type === "error") {
+          this.handlers.delete(msg.jobId);
+        }
+      }
+    });
+
+    this.worker.addEventListener("error", (event) => {
+      console.error("[WorkerPool] Uncaught worker error:", event.message);
+    });
+  }
+
+  enqueue(
+    jobId: string,
+    buffer: ArrayBuffer,
+    fileName: string,
+    fileType: DocumentType,
+    handler: JobHandler
+  ): void {
+    this.handlers.set(jobId, handler);
+
+    const msg: WorkerIngestMessage = {
+      type: "ingest",
+      jobId,
+      buffer,
+      fileName,
+      fileType,
+    };
+
+    // Transfer ArrayBuffer ownership — zero-copy, buffer is neutered on this side
+    this.worker.postMessage(msg, [buffer]);
+  }
+
+  terminate(): void {
+    this.worker.terminate();
+    this.handlers.clear();
+  }
+}
+
+// ── Singleton ─────────────────────────────────────────────────────────────
+
+let instance: WorkerPool | null = null;
+
+/**
+ * Returns the shared WorkerPool instance, creating it on first call.
+ * Safe to call multiple times; the worker is only instantiated once.
+ * Returns null during SSR (no `window` available).
+ */
+export function getWorkerPool(): WorkerPool | null {
+  if (typeof window === "undefined") return null;
+  if (!instance) instance = new WorkerPool();
+  return instance;
+}
+
+/**
+ * Tear down the shared WorkerPool. Call this when the app unmounts
+ * (e.g. in a top-level useEffect cleanup).
+ */
+export function terminateWorkerPool(): void {
+  instance?.terminate();
+  instance = null;
+}
+
+
+-----------------------------------------------------------------------------------
+
+src/types/index.ts
+
+/** Shared TypeScript interfaces for MindForge Local */
+
+// ── Document / Ingestion ────────────────────────────────────────────────────
+
+export type DocumentType = "pdf" | "md" | "txt";
+
+export type IngestionStatus =
+  | "idle"
+  | "extracting"
+  | "chunking"
+  | "embedding"
+  | "indexing"
+  | "done"
+  | "error";
+
+export interface TextChunk {
+  /** Globally unique: `${docId}-${index}` */
+  id: string;
+  docId: string;
+  docName?: string;
+  index: number;
+  text: string;
+  startChar: number;
+  endChar: number;
+  /** Rough estimate: Math.ceil(text.length / 4) */
+  tokenEstimate: number;
+  /** 384-dimensional vector embedding generated by all-MiniLM-L6-v2 */
+  embedding?: number[];
+}
+
+export interface DocumentMeta {
+  id: string;
+  name: string;
+  type: DocumentType;
+  sizeBytes: number;
+  addedAt: number; // Unix ms
+  status: IngestionStatus;
+  /** 0–100, defined while status is extracting, chunking, embedding, or indexing */
+  progress?: number;
+  chunkCount?: number;
+  chunks?: TextChunk[];
+  errorMessage?: string;
+}
+
+// ── Ingestion Worker Message Protocol ───────────────────────────────────────
+
+export interface WorkerIngestMessage {
+  type: "ingest";
+  jobId: string;
+  buffer: ArrayBuffer;
+  fileName: string;
+  fileType: DocumentType;
+}
+
+export interface WorkerProgressMessage {
+  type: "progress";
+  jobId: string;
+  status: IngestionStatus;
+  progress: number; // 0–100
+  message: string;
+}
+
+export interface WorkerDoneMessage {
+  type: "done";
+  jobId: string;
+  chunks: TextChunk[];
+  pageCount?: number;
+}
+
+export interface WorkerErrorMessage {
+  type: "error";
+  jobId: string;
+  message: string;
+}
+
+export type WorkerOutMessage =
+  | WorkerProgressMessage
+  | WorkerDoneMessage
+  | WorkerErrorMessage;
+
+// ── Embedding Worker Message Protocol ───────────────────────────────────────
+
+export interface EmbedWorkerTask {
+  type: "embed";
+  jobId: string;
+  docId: string;
+  chunks: TextChunk[];
+}
+
+export interface EmbedWorkerProgress {
+  type: "embed-progress";
+  jobId: string;
+  docId: string;
+  progress: number; // 0–100
+  current: number;
+  total: number;
+  message: string;
+}
+
+export interface EmbedWorkerDone {
+  type: "embed-done";
+  jobId: string;
+  docId: string;
+  chunks: TextChunk[];
+}
+
+export interface EmbedWorkerError {
+  type: "embed-error";
+  jobId: string;
+  docId: string;
+  message: string;
+}
+
+export type EmbedWorkerOutMessage =
+  | EmbedWorkerProgress
+  | EmbedWorkerDone
+  | EmbedWorkerError;
+
+// ── FileItem (drop-zone → dashboard) ───────────────────────────────────────
+
+export interface FileItem {
+  meta: DocumentMeta;
+  file: File;
+}
+
+// ── Vector Search Result ───────────────────────────────────────────────────
+
+export interface VectorSearchResult {
+  chunk: TextChunk;
+  score: number;
+}
+
+// ── Hardware / WebGPU ───────────────────────────────────────────────────────
+
+export type WebGPUStatus = "checking" | "supported" | "unsupported" | "error";
+
+export interface GPUAdapterInfo {
+  vendor: string;
+  architecture: string;
+  device: string;
+  description: string;
+}
+
+export interface HardwareInfo {
+  webgpuStatus: WebGPUStatus;
+  adapterInfo?: GPUAdapterInfo;
+  estimatedVRAMMB?: number;
+  usedJSHeapMB?: number;
+  totalJSHeapMB?: number;
+  jsHeapLimitMB?: number;
+  backend?: string;
+}
+
+// ── Chat / RAG ──────────────────────────────────────────────────────────────
+
+export type MessageRole = "user" | "assistant" | "system";
+
+export interface ChatMessage {
+  id: string;
+  role: MessageRole;
+  content: string;
+  timestamp: number;
+  sources?: string[]; // chunk IDs used as context
+  isStreaming?: boolean;
+}
+
+export interface RAGSession {
+  id: string;
+  messages: ChatMessage[];
+  createdAt: number;
+}
+
+// ── Knowledge Graph ─────────────────────────────────────────────────────────
+
+export interface GraphNode {
+  id: string;
+  label: string;
+  documentId: string;
+  chunkIndex: number;
+  group?: number;
+}
+
+export interface GraphLink {
+  source: string;
+  target: string;
+  weight: number;
+}
+
+export interface KnowledgeGraph {
+  nodes: GraphNode[];
+  links: GraphLink[];
+}
+
+// ── Storage ─────────────────────────────────────────────────────────────────
+
+export interface StorageEstimate {
+  usageBytes: number;
+  quotaBytes: number;
+  usagePercent: number;
+  vectorCount?: number;
+}
+
+------------------------------------------------------------------------------------------
+
+src/workers/embed.worker.ts
+/**
+ * embed.worker.ts
+ *
+ * Off-main-thread Web Worker for generating 384-dimensional vector embeddings
+ * using @xenova/transformers with Xenova/all-MiniLM-L6-v2.
+ */
+
+import { pipeline, env } from "@xenova/transformers";
+import type { TextChunk, EmbedWorkerTask, EmbedWorkerOutMessage } from "@/types";
+
+// Configure Transformers.js environment for browser worker
+env.allowLocalModels = false;
+env.useBrowserCache = true;
+
+let extractorPipeline: any = null;
+
+async function getExtractor() {
+  if (!extractorPipeline) {
+    console.log("[EmbedWorker] Loading model Xenova/all-MiniLM-L6-v2...");
+    extractorPipeline = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+    console.log("[EmbedWorker] Model loaded successfully.");
+  }
+  return extractorPipeline;
+}
+
+function post(msg: EmbedWorkerOutMessage) {
+  (self as unknown as Worker).postMessage(msg);
+}
+
+async function handleEmbedTask(task: EmbedWorkerTask) {
+  const { jobId, docId, chunks } = task;
+  console.log(`[EmbedWorker] Starting embedding for ${chunks.length} chunks (docId: ${docId})`);
+
+  try {
+    post({
+      type: "embed-progress",
+      jobId,
+      docId,
+      progress: 0,
+      current: 0,
+      total: chunks.length,
+      message: "Loading embedding model…",
+    });
+
+    const extractor = await getExtractor();
+    const chunksWithEmbeddings: TextChunk[] = [];
+    const total = chunks.length;
+
+    for (let i = 0; i < total; i++) {
+      const chunk = chunks[i];
+
+      // Extract 384-dim normalized vector
+      const output = await extractor(chunk.text, {
+        pooling: "mean",
+        normalize: true,
+      });
+
+      const embeddingArray = Array.from(output.data as Float32Array);
+
+      chunksWithEmbeddings.push({
+        ...chunk,
+        embedding: embeddingArray,
+      });
+
+      const pct = Math.round(((i + 1) / total) * 100);
+      post({
+        type: "embed-progress",
+        jobId,
+        docId,
+        progress: pct,
+        current: i + 1,
+        total,
+        message: `Embedding chunk ${i + 1} / ${total}`,
+      });
+
+      // Yield event loop so worker postMessage can flush
+      await new Promise<void>((r) => setTimeout(r, 0));
+    }
+
+    console.log(`[EmbedWorker] Completed embeddings for docId: ${docId}`);
+    post({
+      type: "embed-done",
+      jobId,
+      docId,
+      chunks: chunksWithEmbeddings,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[EmbedWorker] Error embedding docId ${docId}:`, message);
+    post({
+      type: "embed-error",
+      jobId,
+      docId,
+      message,
+    });
+  }
+}
+
+self.addEventListener("message", (event: MessageEvent<EmbedWorkerTask>) => {
+  if (event.data?.type === "embed") {
+    handleEmbedTask(event.data);
+  }
+});
+
+
+src/workers/ingestion.worker.ts
+
+/**
+ * ingestion.worker.ts
+ *
+ * Off-main-thread document ingestion pipeline:
+ *   1. Receive an ArrayBuffer + metadata from the main thread
+ *   2. Extract plain text (PDF via pdfjs-dist, MD/TXT via TextDecoder)
+ *   3. Chunk text with the recursive character splitter
+ *   4. Post granular progress updates and the final chunk array back
+ *
+ * Message protocol:
+ *   IN  → { type: 'ingest', jobId, buffer, fileName, fileType }
+ *   OUT → { type: 'progress', jobId, status, progress, message }
+ *   OUT → { type: 'done',     jobId, chunks, pageCount? }
+ *   OUT → { type: 'error',    jobId, message }
+ */
+
+// @ts-ignore — pdfjs-dist is an ESM package; webpack handles the resolution
+import * as pdfjsLib from "pdfjs-dist";
+import { chunkText } from "@/lib/chunker";
+import type {
+  WorkerIngestMessage,
+  WorkerOutMessage,
+  TextChunk,
+} from "@/types";
+
+// ── Configure pdfjs worker ────────────────────────────────────────────────
+// Use an absolute path so it resolves correctly regardless of the compiled
+// worker chunk URL. The file is served from /public/pdf.worker.min.mjs.
+pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+
+// ── Typed postMessage helper ──────────────────────────────────────────────
+function post(msg: WorkerOutMessage) {
+  (self as unknown as Worker).postMessage(msg);
+}
+
+function progress(
+  jobId: string,
+  status: import("@/types").IngestionStatus,
+  pct: number,
+  message: string
+) {
+  post({ type: "progress", jobId, status, progress: pct, message });
+}
+
+// ── PDF extraction ────────────────────────────────────────────────────────
+async function extractPdfText(
+  jobId: string,
+  buffer: ArrayBuffer
+): Promise<{ text: string; pageCount: number }> {
+  const doc = await pdfjsLib.getDocument({ data: buffer }).promise;
+  const pageCount = doc.numPages;
+  const pages: string[] = [];
+
+  for (let i = 1; i <= pageCount; i++) {
+    const page = await doc.getPage(i);
+    const content = await page.getTextContent();
+    const pageText = content.items
+      .map((item) => ("str" in item ? (item.str as string) : ""))
+      .join(" ");
+    pages.push(pageText);
+
+    const pct = Math.round((i / pageCount) * 60); // extraction = 0–60%
+    progress(jobId, "extracting", pct, `Extracting page ${i} / ${pageCount}`);
+  }
+
+  return { text: pages.join("\n\n"), pageCount };
+}
+
+// ── Text / Markdown extraction ────────────────────────────────────────────
+function extractPlainText(buffer: ArrayBuffer): string {
+  return new TextDecoder("utf-8").decode(buffer);
+}
+
+// ── Main message handler ──────────────────────────────────────────────────
+async function handleIngest(msg: WorkerIngestMessage) {
+  const { jobId, buffer, fileType } = msg;
+  console.log(`[IngestionWorker] Starting job ${jobId} (${fileType})`);
+
+  try {
+    // ── Step 1: Extract text ──────────────────────────────────────────
+    progress(jobId, "extracting", 0, "Starting extraction…");
+
+    let rawText: string;
+    let pageCount: number | undefined;
+
+    if (fileType === "pdf") {
+      const result = await extractPdfText(jobId, buffer);
+      rawText = result.text;
+      pageCount = result.pageCount;
+    } else {
+      rawText = extractPlainText(buffer);
+      progress(jobId, "extracting", 60, "Text decoded");
+    }
+
+    // ── Step 2: Chunk ─────────────────────────────────────────────────
+    progress(jobId, "chunking", 65, "Splitting into chunks…");
+
+    const chunks: TextChunk[] = chunkText(jobId, rawText, msg.fileName);
+
+    // Simulate brief chunking progress ticks for visual feedback
+    const tickCount = Math.min(chunks.length, 10);
+    for (let t = 0; t < tickCount; t++) {
+      const pct = 65 + Math.round((t / tickCount) * 30); // chunking = 65–95%
+      progress(
+        jobId,
+        "chunking",
+        pct,
+        `Chunked ${Math.round(((t + 1) / tickCount) * chunks.length)} / ${chunks.length}`
+      );
+      // Yield to the event loop so progress messages can be flushed
+      await new Promise<void>((r) => setTimeout(r, 0));
+    }
+
+    progress(jobId, "chunking", 98, `${chunks.length} chunks ready`);
+
+    console.log(
+      `[IngestionWorker] Done: ${chunks.length} chunks for job ${jobId}`
+    );
+
+    post({ type: "done", jobId, chunks, pageCount });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[IngestionWorker] Error in job ${jobId}:`, message);
+    post({ type: "error", jobId, message });
+  }
+}
+
+// ── Event listener ────────────────────────────────────────────────────────
+self.addEventListener("message", (event: MessageEvent<WorkerIngestMessage>) => {
+  if (event.data?.type === "ingest") {
+    handleIngest(event.data);
+  }
+});
+
+
+-------------------------------------------------------------------------------------
+
+src/hooks/useIngestionPipe line.ts
+
+"use client";
+
+/**
+ * useIngestionPipeline
+ *
+ * Manages the multi-stage off-thread document ingestion pipeline:
+ * 1. Extraction & Chunking Worker (ingestion.worker.ts via pdfjs-dist & chunker)
+ * 2. Embedding Worker (embed.worker.ts via @xenova/transformers all-MiniLM-L6-v2)
+ * 3. Vector Database Storage (vectorStore.ts via @orama/orama & IndexedDB)
+ */
+
+import { useEffect, useRef, useCallback } from "react";
+import { getWorkerPool, terminateWorkerPool } from "@/lib/workerPool";
+import { getEmbedWorkerPool, terminateEmbedWorkerPool } from "@/lib/embedWorkerPool";
+import { insertDocChunks, initVectorStore, savePersistedDocuments, loadPersistedDocuments, clearVectorStore } from "@/lib/vectorStore";
+import type { DocumentMeta, FileItem, WorkerOutMessage, EmbedWorkerOutMessage } from "@/types";
+
+type UpdateHandler = (id: string, patch: Partial<DocumentMeta>) => void;
+type HydrateHandler = (docs: DocumentMeta[]) => void;
+
+export function useIngestionPipeline(
+  onUpdate: UpdateHandler,
+  onHydrate?: HydrateHandler
+) {
+  const onUpdateRef = useRef<UpdateHandler>(onUpdate);
+  const onHydrateRef = useRef<HydrateHandler | undefined>(onHydrate);
+
+  useEffect(() => {
+    onUpdateRef.current = onUpdate;
+    onHydrateRef.current = onHydrate;
+  });
+
+  // Hydrate vector store and persisted documents on startup
+  useEffect(() => {
+    getWorkerPool();
+    getEmbedWorkerPool();
+
+    let isMounted = true;
+    (async () => {
+      await initVectorStore();
+      const savedDocs = await loadPersistedDocuments();
+      if (isMounted && savedDocs.length > 0 && onHydrateRef.current) {
+        onHydrateRef.current(savedDocs);
+      }
+    })();
+
+    return () => {
+      isMounted = false;
+      terminateWorkerPool();
+      terminateEmbedWorkerPool();
+    };
+  }, []);
+
+  const processFiles = useCallback((items: FileItem[]) => {
+    const pool = getWorkerPool();
+    const embedPool = getEmbedWorkerPool();
+    if (!pool || !embedPool) return;
+
+    items.forEach(({ meta, file }) => {
+      file
+        .arrayBuffer()
+        .then((buffer) => {
+          // Step 1: Ingestion worker (extraction & chunking)
+          pool.enqueue(
+            meta.id,
+            buffer,
+            meta.name,
+            meta.type,
+            (msg: WorkerOutMessage) => {
+              const update = onUpdateRef.current;
+
+              if (msg.type === "progress") {
+                update(meta.id, {
+                  status: msg.status,
+                  progress: msg.progress,
+                });
+              } else if (msg.type === "done") {
+                // Step 2: Embedding worker (384-dim vectors)
+                update(meta.id, {
+                  status: "embedding",
+                  progress: 0,
+                  chunkCount: msg.chunks.length,
+                });
+
+                const embedJobId = `embed-${meta.id}`;
+                embedPool.enqueue(
+                  embedJobId,
+                  meta.id,
+                  msg.chunks,
+                  (embedMsg: EmbedWorkerOutMessage) => {
+                    if (embedMsg.type === "embed-progress") {
+                      update(meta.id, {
+                        status: "embedding",
+                        progress: embedMsg.progress,
+                      });
+                    } else if (embedMsg.type === "embed-done") {
+                      // Step 3: Indexing into Orama vector database & IndexedDB
+                      update(meta.id, {
+                        status: "indexing",
+                        progress: 95,
+                      });
+
+                      insertDocChunks(meta.id, embedMsg.chunks)
+                        .then(() => {
+                          update(meta.id, {
+                            status: "done",
+                            progress: 100,
+                            chunks: embedMsg.chunks,
+                            chunkCount: embedMsg.chunks.length,
+                          });
+                        })
+                        .catch((err) => {
+                          const message = err instanceof Error ? err.message : String(err);
+                          update(meta.id, {
+                            status: "error",
+                            progress: 0,
+                            errorMessage: `Vector indexing failed: ${message}`,
+                          });
+                        });
+                    } else if (embedMsg.type === "embed-error") {
+                      update(meta.id, {
+                        status: "error",
+                        progress: 0,
+                        errorMessage: `Embedding failed: ${embedMsg.message}`,
+                      });
+                    }
+                  }
+                );
+              } else if (msg.type === "error") {
+                update(meta.id, {
+                  status: "error",
+                  progress: 0,
+                  errorMessage: msg.message,
+                });
+              }
+            }
+          );
+        })
+        .catch((err) => {
+          const message = err instanceof Error ? err.message : String(err);
+          onUpdateRef.current(meta.id, { status: "error", errorMessage: message });
+        });
+    });
+  }, []);
+
+  const purgeAllStorage = useCallback(async () => {
+    await clearVectorStore();
+    await savePersistedDocuments([]);
+  }, []);
+
+  return { processFiles, purgeAllStorage };
+}
+
+------------------------------------------------------------------------------------------------
+
+src/components/center/AgentChat.tsx
+
+"use client";
+
+import { useState, useRef, useEffect } from "react";
+import { Send, Bot, User, Cpu, Paperclip, Sparkles, FileText, CheckCircle2, Loader2, Download } from "lucide-react";
+import type { ChatMessage, DocumentMeta, VectorSearchResult } from "@/types";
+import {
+  subscribeEngineState,
+  loadModelEngine,
+  streamRAGCompletion,
+  SUPPORTED_MODELS,
+  type EngineState,
+} from "@/lib/webLlmEngine";
+import { searchVector } from "@/lib/vectorStore";
+
+interface ExtendedChatMessage extends ChatMessage {
+  searchResults?: VectorSearchResult[];
+}
+
+interface AgentChatProps {
+  documents: DocumentMeta[];
+  initialPrompt?: string;
+}
+
+function MessageBubble({ msg }: { msg: ExtendedChatMessage }) {
+  const isUser = msg.role === "user";
+
+  return (
+    <div
+      className={`flex items-start gap-3 animate-fade-in-up ${
+        isUser ? "flex-row-reverse" : "flex-row"
+      }`}
+    >
+      {/* Avatar */}
+      <div
+        className="w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5"
+        style={{
+          background: isUser
+            ? "linear-gradient(135deg, #6366f1, #a855f7)"
+            : "linear-gradient(135deg, #0ea5e9, #22d3ee)",
+        }}
+      >
+        {isUser ? (
+          <User className="w-3.5 h-3.5 text-white" />
+        ) : (
+          <Bot className="w-3.5 h-3.5 text-white" />
+        )}
+      </div>
+
+      {/* Content Stack */}
+      <div className="flex flex-col gap-2 max-w-[80%]">
+        {/* Bubble */}
+        <div
+          className="px-4 py-2.5 rounded-2xl text-[13px] leading-relaxed whitespace-pre-wrap"
+          style={
+            isUser
+              ? {
+                  background: "linear-gradient(135deg, rgba(99,102,241,0.25), rgba(168,85,247,0.15))",
+                  border: "1px solid rgba(99,102,241,0.3)",
+                  color: "#e2e8f0",
+                  borderTopRightRadius: "4px",
+                }
+              : {
+                  background: "rgba(14, 165, 233, 0.07)",
+                  border: "1px solid rgba(14,165,233,0.15)",
+                  color: "#cbd5e1",
+                  borderTopLeftRadius: "4px",
+                }
+          }
+        >
+          {msg.isStreaming && !msg.content ? (
+            <span className="flex items-center gap-1.5 text-cyan-400 font-mono text-[11px]">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              MindForge AI is thinking…
+            </span>
+          ) : (
+            msg.content
+          )}
+        </div>
+
+        {/* Retrieved Sources Citation Cards */}
+        {msg.searchResults && msg.searchResults.length > 0 && !msg.isStreaming && (
+          <div
+            className="rounded-xl p-2.5 space-y-1.5"
+            style={{
+              background: "rgba(99,102,241,0.04)",
+              border: "1px solid rgba(99,102,241,0.12)",
+            }}
+          >
+            <div className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-indigo-400">
+              <Sparkles className="w-3 h-3" />
+              Retrieved Context Sources ({msg.searchResults.length})
+            </div>
+            <div className="space-y-1">
+              {msg.searchResults.map((res, i) => (
+                <div
+                  key={res.chunk.id}
+                  className="px-2 py-1 rounded bg-black/20 text-[10px] space-y-0.5 border border-white/5"
+                >
+                  <div className="flex items-center justify-between text-slate-400">
+                    <span className="flex items-center gap-1 font-mono truncate max-w-[200px]" title={res.chunk.docName}>
+                      <FileText className="w-2.5 h-2.5 text-indigo-400 flex-shrink-0" />
+                      {res.chunk.docName ? res.chunk.docName : "Document"} (Chunk #{res.chunk.index + 1})
+                    </span>
+                    <span className="font-mono text-cyan-400">
+                      Score: {(res.score * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                  <p className="text-slate-300 line-clamp-2 italic">
+                    "{res.chunk.text}"
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const WELCOME_MESSAGE: ExtendedChatMessage = {
+  id: "welcome",
+  role: "assistant",
+  content:
+    "Hello! I'm your MindForge RAG agent, running fully in-browser on WebGPU. Upload documents in the left panel, load a WebGPU model above, and ask me anything — I'll retrieve relevant vector context locally with zero cloud calls.",
+  timestamp: Date.now(),
+};
+
+export default function AgentChat({ documents, initialPrompt }: AgentChatProps) {
+  const [messages, setMessages] = useState<ExtendedChatMessage[]>([WELCOME_MESSAGE]);
+  const [input, setInput] = useState("");
+  const [engineState, setEngineState] = useState<EngineState>({
+    status: "unloaded",
+    selectedModelId: SUPPORTED_MODELS[0].id,
+    progress: 0,
+    progressText: "",
+    errorMessage: null,
+  });
+
+  useEffect(() => {
+    if (initialPrompt) {
+      setInput(initialPrompt);
+    }
+  }, [initialPrompt]);
+
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const unsubscribe = subscribeEngineState(setEngineState);
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const handleLoadModel = () => {
+    loadModelEngine(engineState.selectedModelId).catch(() => {});
+  };
+
+  const sendMessage = async () => {
+    const text = input.trim();
+    if (!text) return;
+
+    const userMsg: ExtendedChatMessage = {
+      id: Date.now().toString(),
+      role: "user",
+      content: text,
+      timestamp: Date.now(),
+    };
+
+    const thinkingId = `${Date.now()}-response`;
+    const thinkingMsg: ExtendedChatMessage = {
+      id: thinkingId,
+      role: "assistant",
+      content: "",
+      timestamp: Date.now(),
+      isStreaming: true,
+    };
+
+    setMessages((prev) => [...prev, userMsg, thinkingMsg]);
+    setInput("");
+
+    // If WebLLM engine is loaded and ready, run full WebGPU RAG streaming
+    if (engineState.status === "ready") {
+      try {
+        const { sources } = await streamRAGCompletion(text, (_token, accumulated) => {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === thinkingId
+                ? {
+                    ...m,
+                    isStreaming: true,
+                    content: accumulated,
+                  }
+                : m
+            )
+          );
+        });
+
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === thinkingId
+              ? {
+                  ...m,
+                  isStreaming: false,
+                  searchResults: sources,
+                }
+              : m
+          )
+        );
+      } catch (err) {
+        const errMessage = err instanceof Error ? err.message : String(err);
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === thinkingId
+              ? {
+                  ...m,
+                  isStreaming: false,
+                  content: `[WebGPU Execution Error]: ${errMessage}`,
+                }
+              : m
+          )
+        );
+      }
+    } else {
+      // Fallback RAG retrieval mode if LLM is not loaded yet
+      setTimeout(async () => {
+        let sources: VectorSearchResult[] = [];
+        try {
+          // Vector search using query vector if available
+          // (vector search simulated fallback response)
+        } catch {}
+
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === thinkingId
+              ? {
+                  ...m,
+                  isStreaming: false,
+                  content:
+                    documents.length === 0
+                      ? "No documents have been ingested yet. Please upload PDF, MD, or TXT files in the left panel and click 'Load Model' to activate WebGPU RAG."
+                      : `Vector database active (${documents.length} document(s) ingested). Click 'Load Model' in the status bar above to start the WebGPU LLM engine for streaming answers.`,
+                  searchResults: sources,
+                }
+              : m
+          )
+        );
+      }, 600);
+    }
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  };
+
+  const currentModelSpec = SUPPORTED_MODELS.find((m) => m.id === engineState.selectedModelId);
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Model status bar */}
+      <div
+        className="flex items-center gap-2 px-5 py-2.5 flex-shrink-0"
+        style={{ borderBottom: "1px solid rgba(255,255,255,0.04)" }}
+      >
+        <Cpu className="w-3.5 h-3.5" style={{ color: "#6366f1" }} />
+        <span className="text-[11px] font-medium" style={{ color: "#475569" }}>
+          WebGPU Model:
+        </span>
+
+        {engineState.status === "ready" && (
+          <span
+            className="flex items-center gap-1 text-[11px] px-2.5 py-0.5 rounded-full font-medium"
+            style={{
+              background: "rgba(34,211,238,0.12)",
+              border: "1px solid rgba(34,211,238,0.3)",
+              color: "#22d3ee",
+            }}
+          >
+            <CheckCircle2 className="w-3 h-3" />
+            {currentModelSpec?.name || "WebGPU Model"} (Active)
+          </span>
+        )}
+
+        {engineState.status === "loading" && (
+          <span
+            className="flex items-center gap-1.5 text-[11px] px-2.5 py-0.5 rounded-full font-mono"
+            style={{
+              background: "rgba(168,85,247,0.12)",
+              border: "1px solid rgba(168,85,247,0.3)",
+              color: "#c084fc",
+            }}
+          >
+            <Loader2 className="w-3 h-3 animate-spin" />
+            Loading {engineState.progress}%
+          </span>
+        )}
+
+        {engineState.status === "unloaded" && (
+          <button
+            onClick={handleLoadModel}
+            className="flex items-center gap-1 text-[11px] px-2.5 py-0.5 rounded-full font-medium transition-all duration-150 hover:bg-indigo-500/20"
+            style={{
+              background: "rgba(99,102,241,0.1)",
+              border: "1px solid rgba(99,102,241,0.25)",
+              color: "#818cf8",
+            }}
+          >
+            <Download className="w-3 h-3" />
+            Click to Load {currentModelSpec?.name || "Model"}
+          </button>
+        )}
+
+        {engineState.status === "error" && (
+          <span
+            className="text-[11px] px-2.5 py-0.5 rounded-full font-mono"
+            style={{
+              background: "rgba(244,63,94,0.12)",
+              border: "1px solid rgba(244,63,94,0.3)",
+              color: "#f43f5e",
+            }}
+          >
+            Model Load Error
+          </span>
+        )}
+
+        <div className="flex-1" />
+        <span className="text-[10px]" style={{ color: "#334155" }}>
+          {documents.length} doc{documents.length !== 1 ? "s" : ""} in context
+        </span>
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4 min-h-0">
+        {messages.map((msg) => (
+          <MessageBubble key={msg.id} msg={msg} />
+        ))}
+        <div ref={bottomRef} />
+      </div>
+
+      {/* Input bar */}
+      <div
+        className="flex-shrink-0 px-4 py-3"
+        style={{ borderTop: "1px solid rgba(99,102,241,0.08)" }}
+      >
+        <div
+          className="flex items-end gap-2 rounded-xl px-3 py-2"
+          style={{
+            background: "rgba(255,255,255,0.04)",
+            border: "1px solid rgba(99,102,241,0.15)",
+          }}
+        >
+          <button
+            className="flex-shrink-0 mb-1 p-1 rounded-lg transition-colors hover:bg-white/5"
+            title="Attach file"
+          >
+            <Paperclip className="w-4 h-4" style={{ color: "#475569" }} />
+          </button>
+
+          <textarea
+            id="chat-input"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder="Ask about your documents… (Enter to send)"
+            rows={1}
+            className="flex-1 bg-transparent resize-none outline-none text-[13px] placeholder:text-[#334155] leading-relaxed"
+            style={{
+              color: "#e2e8f0",
+              maxHeight: "120px",
+              overflowY: "auto",
+            }}
+          />
+
+          <button
+            id="chat-send-btn"
+            onClick={sendMessage}
+            disabled={!input.trim()}
+            className="flex-shrink-0 mb-0.5 w-7 h-7 rounded-lg flex items-center justify-center transition-all duration-150 disabled:opacity-30"
+            style={{
+              background: input.trim()
+                ? "linear-gradient(135deg, #6366f1, #a855f7)"
+                : "rgba(99,102,241,0.15)",
+            }}
+          >
+            <Send className="w-3.5 h-3.5 text-white" />
+          </button>
+        </div>
+        <p className="text-[9px] text-center mt-1.5" style={{ color: "#1e2a3d" }}>
+          100% local · Air-Gapped · Powered by WebGPU & WebLLM
+        </p>
+      </div>
+    </div>
+  );
+}
+
+
+src/components/center/CenterView.tsx
+"use client";
+
+import { useState, useCallback } from "react";
+import { Network, MessageSquareText } from "lucide-react";
+import KnowledgeMesh from "./KnowledgeMesh";
+import AgentChat from "./AgentChat";
+import type { DocumentMeta } from "@/types";
+
+type Tab = "mesh" | "chat";
+
+interface CenterViewProps {
+  documents: DocumentMeta[];
+}
+
+export default function CenterView({ documents }: CenterViewProps) {
+  const [activeTab, setActiveTab] = useState<Tab>("mesh");
+  const [conceptPrompt, setConceptPrompt] = useState<string>("");
+
+  const handleSelectConceptPrompt = useCallback((promptText: string) => {
+    setConceptPrompt(promptText);
+    setActiveTab("chat");
+  }, []);
+
+  return (
+    <div className="flex flex-col h-full overflow-hidden" style={{ background: "#070a12" }}>
+      {/* Top Bar */}
+      <div
+        className="flex items-center gap-2 px-6 py-3 flex-shrink-0"
+        style={{ borderBottom: "1px solid rgba(99,102,241,0.08)" }}
+      >
+        {/* Tab Switcher */}
+        <div
+          className="flex items-center gap-1 p-1 rounded-xl"
+          style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.06)" }}
+        >
+          <button
+            id="tab-mesh"
+            onClick={() => setActiveTab("mesh")}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-[12px] font-medium transition-all duration-200 ${
+              activeTab === "mesh" ? "forge-tab-active" : "forge-tab-inactive"
+            }`}
+          >
+            <Network className="w-3.5 h-3.5" />
+            3D Knowledge Mesh
+          </button>
+          <button
+            id="tab-chat"
+            onClick={() => setActiveTab("chat")}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-[12px] font-medium transition-all duration-200 ${
+              activeTab === "chat" ? "forge-tab-active" : "forge-tab-inactive"
+            }`}
+          >
+            <MessageSquareText className="w-3.5 h-3.5" />
+            Agent Chat
+          </button>
+        </div>
+
+        {/* Spacer */}
+        <div className="flex-1" />
+
+        {/* Doc count badge */}
+        {documents.length > 0 && (
+          <div
+            className="flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-medium"
+            style={{
+              background: "rgba(99,102,241,0.12)",
+              border: "1px solid rgba(99,102,241,0.25)",
+              color: "#818cf8",
+            }}
+          >
+            <span
+              className="w-1.5 h-1.5 rounded-full"
+              style={{ background: "#6366f1" }}
+            />
+            {documents.length} document{documents.length !== 1 ? "s" : ""}
+          </div>
+        )}
+      </div>
+
+      {/* Tab Content */}
+      <div className="flex-1 min-h-0 relative">
+        <div
+          className={`absolute inset-0 transition-opacity duration-300 ${
+            activeTab === "mesh" ? "opacity-100 pointer-events-auto" : "opacity-0 pointer-events-none"
+          }`}
+        >
+          <KnowledgeMesh
+            documents={documents}
+            onSelectConceptPrompt={handleSelectConceptPrompt}
+          />
+        </div>
+        <div
+          className={`absolute inset-0 transition-opacity duration-300 ${
+            activeTab === "chat" ? "opacity-100 pointer-events-auto" : "opacity-0 pointer-events-none"
+          }`}
+        >
+          <AgentChat documents={documents} initialPrompt={conceptPrompt} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+src/components/center/KnowledgeMesh.tsx
+
+"use client";
+
+import { useState, useMemo } from "react";
+import dynamic from "next/dynamic";
+import { Network, FileText, X, Sparkles, Search, Layers, Cpu } from "lucide-react";
+import type { DocumentMeta, TextChunk } from "@/types";
+import { build3DKnowledgeGraph, type Graph3DNode, type Graph3DLink } from "@/lib/graphBuilder";
+
+// Dynamically import react-force-graph-3d with ssr: false to prevent window reference errors during SSR
+const ForceGraph3D = dynamic(() => import("react-force-graph-3d"), {
+  ssr: false,
+  loading: () => (
+    <div className="flex flex-col items-center justify-center h-full text-indigo-400 gap-2 font-mono text-xs">
+      <Network className="w-8 h-8 animate-spin" />
+      Loading 3D WebGL Graph Engine…
+    </div>
+  ),
+});
+
+interface KnowledgeMeshProps {
+  documents: DocumentMeta[];
+  onSelectConceptPrompt?: (promptText: string) => void;
+}
+
+export default function KnowledgeMesh({
+  documents,
+  onSelectConceptPrompt,
+}: KnowledgeMeshProps) {
+  const [selectedDocNode, setSelectedDocNode] = useState<Graph3DNode | null>(null);
+  const [chunkSearchQuery, setChunkSearchQuery] = useState("");
+
+  // Extract all text chunks from documents
+  const allChunks = useMemo(() => {
+    const list: TextChunk[] = [];
+    documents.forEach((d) => {
+      if (d.chunks && d.chunks.length > 0) {
+        list.push(...d.chunks);
+      }
+    });
+    return list;
+  }, [documents]);
+
+  // Construct graph node & link data with >0.75 vector similarity cross-links
+  const graphData = useMemo(() => {
+    return build3DKnowledgeGraph(documents, allChunks, 0.75);
+  }, [documents, allChunks]);
+
+  const handleNodeClick = (node: any) => {
+    const gNode = node as Graph3DNode;
+    if (gNode.type === "document") {
+      setSelectedDocNode(gNode);
+    } else if (gNode.type === "concept" && gNode.chunkText) {
+      const promptText = `Explain the key details and context of this excerpt from ${
+        gNode.docName || "the document"
+      }:\n\n"${gNode.chunkText}"`;
+      if (onSelectConceptPrompt) {
+        onSelectConceptPrompt(promptText);
+      }
+    }
+  };
+
+  // Find chunks for selected document node
+  const activeDoc = useMemo(() => {
+    if (!selectedDocNode) return null;
+    return documents.find((d) => d.id === selectedDocNode.docId) ?? null;
+  }, [selectedDocNode, documents]);
+
+  const filteredChunks = useMemo(() => {
+    if (!activeDoc || !activeDoc.chunks) return [];
+    if (!chunkSearchQuery.trim()) return activeDoc.chunks;
+    return activeDoc.chunks.filter((c) =>
+      c.text.toLowerCase().includes(chunkSearchQuery.toLowerCase())
+    );
+  }, [activeDoc, chunkSearchQuery]);
+
+  return (
+    <div className="relative w-full h-full overflow-hidden bg-forge-void">
+      {/* 3D Force Graph canvas */}
+      <div className="absolute inset-0">
+        <ForceGraph3D
+          graphData={graphData}
+          nodeLabel={(n: any) => {
+            const node = n as Graph3DNode;
+            return `<div style="background:rgba(15,23,42,0.9); border:1px solid #6366f1; border-radius:6px; padding:4px 8px; font-size:11px; color:#e2e8f0; font-family:sans-serif;">
+              <strong style="color:${node.color}">${node.type.toUpperCase()}</strong>: ${node.name}
+            </div>`;
+          }}
+          nodeColor={(n: any) => (n as Graph3DNode).color}
+          nodeVal={(n: any) => (n as Graph3DNode).val}
+          linkColor={(l: any) => (l as Graph3DLink).color}
+          linkWidth={(l: any) => ((l as Graph3DLink).type === "similarity" ? 2 : 1)}
+          linkCurvature={(l: any) => (l as Graph3DLink).curvature || 0}
+          linkDirectionalParticles={(l: any) => ((l as Graph3DLink).type === "similarity" ? 3 : 0)}
+          linkDirectionalParticleSpeed={0.006}
+          linkDirectionalParticleWidth={2}
+          linkDirectionalParticleColor={() => "#22d3ee"}
+          onNodeClick={handleNodeClick}
+          backgroundColor="#090d16"
+        />
+      </div>
+
+      {/* Legend & Stats Overlay */}
+      <div className="absolute top-4 left-4 flex flex-col gap-2 pointer-events-none select-none">
+        <div
+          className="flex items-center gap-3 px-3 py-2 rounded-xl"
+          style={{
+            background: "rgba(15,23,42,0.85)",
+            border: "1px solid rgba(99,102,241,0.2)",
+            backdropFilter: "blur(12px)",
+          }}
+        >
+          <div className="flex items-center gap-1.5 text-[11px] font-medium" style={{ color: "#22d3ee" }}>
+            <span className="w-2.5 h-2.5 rounded-full bg-[#22d3ee] inline-block shadow-[0_0_8px_#22d3ee]" />
+            Documents ({documents.length})
+          </div>
+          <div className="flex items-center gap-1.5 text-[11px] font-medium" style={{ color: "#a855f7" }}>
+            <span className="w-2.5 h-2.5 rounded-full bg-[#a855f7] inline-block shadow-[0_0_8px_#a855f7]" />
+            Concepts ({allChunks.length})
+          </div>
+          <div className="flex items-center gap-1.5 text-[11px] font-medium" style={{ color: "#818cf8" }}>
+            <span className="w-3 h-0.5 bg-[#818cf8] inline-block" />
+            Similarity &gt; 0.75
+          </div>
+        </div>
+      </div>
+
+      {/* Live Badge */}
+      <div
+        className="absolute top-4 right-4 flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-semibold tracking-wider uppercase pointer-events-none"
+        style={{
+          background: "rgba(99,102,241,0.1)",
+          border: "1px solid rgba(99,102,241,0.2)",
+          color: "#6366f1",
+        }}
+      >
+        <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
+        3D Force Graph · WebGL
+      </div>
+
+      {/* Empty State Overlay */}
+      {documents.length === 0 && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none">
+          <div
+            className="flex flex-col items-center gap-3 px-6 py-5 rounded-2xl animate-float"
+            style={{
+              background: "rgba(7,10,18,0.85)",
+              border: "1px solid rgba(99,102,241,0.2)",
+              backdropFilter: "blur(12px)",
+            }}
+          >
+            <Network className="w-8 h-8" style={{ color: "#6366f1" }} />
+            <p className="text-[13px] font-semibold gradient-text">
+              Knowledge Mesh Empty
+            </p>
+            <p className="text-[11px] text-center max-w-[220px]" style={{ color: "#64748b" }}>
+              Drop PDF, MD, or TXT documents into the left panel to populate 3D concept nodes and similarity links.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Slide-over Document Chunk Inspector Panel */}
+      {activeDoc && (
+        <div
+          className="absolute top-0 right-0 bottom-0 w-[340px] flex flex-col shadow-2xl z-20 animate-fade-in-left"
+          style={{
+            background: "linear-gradient(180deg, #0f172a 0%, #090d16 100%)",
+            borderLeft: "1px solid rgba(34,211,238,0.25)",
+            backdropFilter: "blur(16px)",
+          }}
+        >
+          {/* Header */}
+          <div className="flex items-center justify-between p-4 border-b border-white/10">
+            <div className="flex items-center gap-2 min-w-0">
+              <FileText className="w-4 h-4 text-cyan-400 flex-shrink-0" />
+              <div className="min-w-0">
+                <h3 className="text-xs font-semibold text-slate-100 truncate" title={activeDoc.name}>
+                  {activeDoc.name}
+                </h3>
+                <p className="text-[10px] text-slate-400">
+                  {activeDoc.chunkCount ?? 0} text chunk(s) indexed
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => setSelectedDocNode(null)}
+              className="p-1 rounded-lg hover:bg-white/10 text-slate-400 hover:text-slate-100 transition-colors"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          {/* Search Bar */}
+          <div className="p-3 border-b border-white/5">
+            <div className="relative flex items-center bg-slate-900/60 rounded-lg px-2.5 py-1.5 border border-white/10">
+              <Search className="w-3.5 h-3.5 text-slate-400 mr-2" />
+              <input
+                type="text"
+                value={chunkSearchQuery}
+                onChange={(e) => setChunkSearchQuery(e.target.value)}
+                placeholder="Search document chunks…"
+                className="w-full bg-transparent text-xs text-slate-200 outline-none placeholder:text-slate-500"
+              />
+            </div>
+          </div>
+
+          {/* Chunk List */}
+          <div className="flex-1 overflow-y-auto p-3 space-y-2 min-h-0">
+            {filteredChunks.map((chunk) => (
+              <div
+                key={chunk.id}
+                className="p-2.5 rounded-xl bg-slate-900/40 border border-white/5 space-y-1.5 hover:border-cyan-500/30 transition-colors cursor-pointer"
+                onClick={() => {
+                  if (onSelectConceptPrompt) {
+                    onSelectConceptPrompt(
+                      `Explain the context of Chunk #${chunk.index + 1} from ${activeDoc.name}:\n\n"${chunk.text}"`
+                    );
+                  }
+                }}
+              >
+                <div className="flex items-center justify-between text-[10px] font-mono">
+                  <span className="text-cyan-400 font-semibold">
+                    Chunk #{chunk.index + 1}
+                  </span>
+                  <span className="text-slate-500">
+                    ~{chunk.tokenEstimate} tokens
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-300 leading-relaxed font-sans line-clamp-4">
+                  {chunk.text}
+                </p>
+                <div className="flex items-center gap-1 text-[9px] text-indigo-400 pt-0.5">
+                  <Sparkles className="w-2.5 h-2.5" />
+                  Click to ask AI about this chunk
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+--------------------------------------------------------------------------------------------------------
+
+src/components/dashboard/Dashboard.tsx
+
+"use client";
+
+import LeftSidebar from "@/components/sidebar-left/LeftSidebar";
+import CenterView from "@/components/center/CenterView";
+import RightSidebar from "@/components/sidebar-right/RightSidebar";
+import { useState, useCallback, useEffect } from "react";
+import { useIngestionPipeline } from "@/hooks/useIngestionPipeline";
+import { removeDocChunks, savePersistedDocuments } from "@/lib/vectorStore";
+import type { DocumentMeta, FileItem } from "@/types";
+
+export default function Dashboard() {
+  const [documents, setDocuments] = useState<DocumentMeta[]>([]);
+
+  // ── Document state helpers ───────────────────────────────────────────────
+
+  /** Merge a partial patch into a specific document by id */
+  const updateDocument = useCallback(
+    (id: string, patch: Partial<DocumentMeta>) => {
+      setDocuments((prev) => {
+        const next = prev.map((doc) => (doc.id === id ? { ...doc, ...patch } : doc));
+        savePersistedDocuments(next);
+        return next;
+      });
+    },
+    []
+  );
+
+  /** Hydrate document list loaded from IndexedDB on startup */
+  const handleHydrateDocuments = useCallback((savedDocs: DocumentMeta[]) => {
+    setDocuments(savedDocs);
+  }, []);
+
+  // ── Ingestion pipeline hook ──────────────────────────────────────────────
+  const { processFiles, purgeAllStorage } = useIngestionPipeline(
+    updateDocument,
+    handleHydrateDocuments
+  );
+
+  // ── Drop-zone handler ────────────────────────────────────────────────────
+
+  const handleFilesAdded = useCallback(
+    (items: FileItem[]) => {
+      setDocuments((prev) => {
+        const next = [...prev, ...items.map((item) => item.meta)];
+        savePersistedDocuments(next);
+        return next;
+      });
+      processFiles(items);
+    },
+    [processFiles]
+  );
+
+  const handleRemoveDocument = useCallback(async (id: string) => {
+    setDocuments((prev) => {
+      const next = prev.filter((d) => d.id !== id);
+      savePersistedDocuments(next);
+      return next;
+    });
+    await removeDocChunks(id);
+  }, []);
+
+  const handleClearStorage = useCallback(async () => {
+    await purgeAllStorage();
+    setDocuments([]);
+  }, [purgeAllStorage]);
+
+  return (
+    <div className="flex h-screen w-full overflow-hidden bg-forge-void">
+      {/* Left Sidebar */}
+      <LeftSidebar
+        documents={documents}
+        onFilesAdded={handleFilesAdded}
+        onRemoveDocument={handleRemoveDocument}
+        onClearStorage={handleClearStorage}
+      />
+
+      {/* Center View */}
+      <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
+        <CenterView documents={documents} />
+      </main>
+
+      {/* Right Sidebar */}
+      <RightSidebar />
+    </div>
+  );
+}
+
+---------------------------------------------------------------------------------------------------
+
+src/components/sidebar-left/DocumentList.tsx
+
+"use client";
+
+import type { DocumentMeta, IngestionStatus } from "@/types";
+import {
+  FileText,
+  FileType2,
+  X,
+  Loader2,
+  CheckCircle2,
+  AlertCircle,
+} from "lucide-react";
+
+interface DocumentListProps {
+  documents: DocumentMeta[];
+  onRemoveDocument: (id: string) => void;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function StatusIcon({ status }: { status: IngestionStatus }) {
+  switch (status) {
+    case "done":
+      return (
+        <CheckCircle2
+          className="w-3 h-3 flex-shrink-0"
+          style={{ color: "#22d3ee" }}
+        />
+      );
+    case "error":
+      return (
+        <AlertCircle
+          className="w-3 h-3 flex-shrink-0"
+          style={{ color: "#f43f5e" }}
+        />
+      );
+    case "idle":
+      return (
+        <span
+          className="w-2 h-2 rounded-full flex-shrink-0"
+          style={{ background: "#475569" }}
+        />
+      );
+    default:
+      return (
+        <Loader2
+          className="w-3 h-3 flex-shrink-0 animate-spin"
+          style={{ color: "#6366f1" }}
+        />
+      );
+  }
+}
+
+function DocTypeIcon({ type }: { type: DocumentMeta["type"] }) {
+  const cls = "w-3.5 h-3.5 flex-shrink-0";
+  switch (type) {
+    case "pdf":
+      return <FileType2 className={cls} style={{ color: "#f59e0b" }} />;
+    case "md":
+      return <FileText className={cls} style={{ color: "#22d3ee" }} />;
+    default:
+      return <FileText className={cls} style={{ color: "#94a3b8" }} />;
+  }
+}
+
+const STATUS_LABELS: Record<IngestionStatus, string> = {
+  idle: "Queued",
+  extracting: "Extracting…",
+  chunking: "Chunking…",
+  embedding: "Embedding…",
+  indexing: "Indexing…",
+  done: "Indexed",
+  error: "Error",
+};
+
+const ACTIVE_STATUSES: IngestionStatus[] = [
+  "extracting",
+  "chunking",
+  "embedding",
+  "indexing",
+];
+
+/** Colour of the progress bar based on current pipeline stage */
+function progressBarColor(status: IngestionStatus): string {
+  switch (status) {
+    case "extracting":
+      return "#f59e0b"; // amber — reading bytes
+    case "chunking":
+      return "#6366f1"; // indigo — splitting
+    case "embedding":
+      return "#a855f7"; // violet — encoding
+    case "indexing":
+      return "#22d3ee"; // cyan — writing index
+    default:
+      return "#6366f1";
+  }
+}
+
+function ProgressBar({
+  status,
+  progress,
+}: {
+  status: IngestionStatus;
+  progress: number;
+}) {
+  const isActive = ACTIVE_STATUSES.includes(status);
+  const color = progressBarColor(status);
+  const pct = Math.max(0, Math.min(100, progress));
+
+  return (
+    <div
+      style={{
+        // Animate the height in/out so it doesn't pop
+        maxHeight: isActive ? "20px" : "0px",
+        opacity: isActive ? 1 : 0,
+        overflow: "hidden",
+        transition: "max-height 0.3s ease, opacity 0.25s ease",
+        marginTop: isActive ? "5px" : "0",
+      }}
+    >
+      {/* Track */}
+      <div
+        className="relative w-full rounded-full overflow-hidden"
+        style={{
+          height: "3px",
+          background: "rgba(255,255,255,0.06)",
+        }}
+      >
+        {/* Fill */}
+        <div
+          className="absolute inset-y-0 left-0 rounded-full"
+          style={{
+            width: `${pct}%`,
+            background: `linear-gradient(90deg, ${color}88, ${color})`,
+            boxShadow: `0 0 6px ${color}66`,
+            transition: "width 0.3s ease",
+          }}
+        />
+      </div>
+
+      {/* Percentage label */}
+      <div className="flex justify-between mt-1">
+        <span
+          className="text-[9px] font-mono"
+          style={{ color }}
+        >
+          {STATUS_LABELS[status]}
+        </span>
+        <span
+          className="text-[9px] font-mono"
+          style={{ color: "#334155" }}
+        >
+          {pct.toFixed(0)}%
+        </span>
+      </div>
+    </div>
+  );
+}
+
+export default function DocumentList({
+  documents,
+  onRemoveDocument,
+}: DocumentListProps) {
+  if (documents.length === 0) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center gap-2 pb-4 opacity-40">
+        <FileText className="w-6 h-6 text-forge-text-muted" />
+        <p className="text-[10px] text-forge-text-muted text-center">
+          No documents yet.
+          <br />
+          Drop files above to begin.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex-1 overflow-y-auto space-y-1 pr-0.5 pb-1">
+      {documents.map((doc, i) => (
+        <div
+          key={doc.id}
+          className="group flex flex-col px-2.5 py-2 rounded-lg transition-all duration-150 animate-fade-in-up"
+          style={{
+            animationDelay: `${i * 30}ms`,
+            background: "rgba(99,102,241,0.04)",
+            border:
+              doc.status === "error"
+                ? "1px solid rgba(244,63,94,0.25)"
+                : "1px solid rgba(99,102,241,0.08)",
+          }}
+          onMouseEnter={(e) => {
+            (e.currentTarget as HTMLDivElement).style.background =
+              "rgba(99,102,241,0.09)";
+          }}
+          onMouseLeave={(e) => {
+            (e.currentTarget as HTMLDivElement).style.background =
+              "rgba(99,102,241,0.04)";
+          }}
+        >
+          {/* Top row: icon + name + remove btn */}
+          <div className="flex items-start gap-2">
+            <DocTypeIcon type={doc.type} />
+
+            <div className="flex-1 min-w-0">
+              <p
+                className="text-[11px] font-medium truncate"
+                style={{ color: "#cbd5e1" }}
+                title={doc.name}
+              >
+                {doc.name}
+              </p>
+              <div className="flex items-center gap-1.5 mt-0.5">
+                <StatusIcon status={doc.status} />
+                <span className="text-[9px]" style={{ color: "#475569" }}>
+                  {STATUS_LABELS[doc.status]}
+                </span>
+                {doc.status === "done" && doc.chunkCount != null && (
+                  <span className="text-[9px]" style={{ color: "#334155" }}>
+                    · {doc.chunkCount} chunks
+                  </span>
+                )}
+                {doc.status !== "done" && (
+                  <span className="text-[9px]" style={{ color: "#334155" }}>
+                    · {formatBytes(doc.sizeBytes)}
+                  </span>
+                )}
+              </div>
+
+              {/* Error message */}
+              {doc.status === "error" && doc.errorMessage && (
+                <p
+                  className="text-[9px] mt-1 leading-tight"
+                  style={{ color: "#f43f5e" }}
+                  title={doc.errorMessage}
+                >
+                  {doc.errorMessage.length > 60
+                    ? doc.errorMessage.slice(0, 60) + "…"
+                    : doc.errorMessage}
+                </p>
+              )}
+            </div>
+
+            <button
+              onClick={() => onRemoveDocument(doc.id)}
+              className="opacity-0 group-hover:opacity-100 flex-shrink-0 mt-0.5 transition-opacity duration-150 rounded p-0.5 hover:bg-red-500/20"
+              title="Remove document"
+            >
+              <X className="w-3 h-3" style={{ color: "#94a3b8" }} />
+            </button>
+          </div>
+
+          {/* Progress bar (slides in while active) */}
+          <ProgressBar
+            status={doc.status}
+            progress={doc.progress ?? 0}
+          />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
+src/components/sidebar-left/FileDropZone.tsx
+
+"use client";
+
+import { useCallback, useState } from "react";
+import { UploadCloud, FileText } from "lucide-react";
+import type { DocumentMeta, DocumentType, FileItem } from "@/types";
+
+interface FileDropZoneProps {
+  onFilesAdded: (items: FileItem[]) => void;
+}
+
+const ACCEPTED_TYPES: Record<string, DocumentType> = {
+  "application/pdf": "pdf",
+  "text/markdown": "md",
+  "text/plain": "txt",
+};
+
+const ACCEPTED_EXTENSIONS = [".pdf", ".md", ".txt"];
+
+function fileToItem(file: File): FileItem | null {
+  const ext = "." + file.name.split(".").pop()?.toLowerCase();
+  const mimeType = file.type as keyof typeof ACCEPTED_TYPES;
+  const type: DocumentType | null =
+    ACCEPTED_TYPES[mimeType] ??
+    (ext === ".md" ? "md" : ext === ".txt" ? "txt" : null);
+
+  if (!type) return null;
+
+  const meta: DocumentMeta = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    name: file.name,
+    type,
+    sizeBytes: file.size,
+    addedAt: Date.now(),
+    status: "extracting", // immediately transition to active state
+    progress: 0,
+  };
+
+  return { meta, file };
+}
+
+export default function FileDropZone({ onFilesAdded }: FileDropZoneProps) {
+  const [isDragging, setIsDragging] = useState(false);
+
+  const processFiles = useCallback(
+    (files: FileList | File[]) => {
+      const items = Array.from(files)
+        .map(fileToItem)
+        .filter(Boolean) as FileItem[];
+      if (items.length > 0) onFilesAdded(items);
+    },
+    [onFilesAdded]
+  );
+
+  const onDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+  const onDragLeave = () => setIsDragging(false);
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    processFiles(e.dataTransfer.files);
+  };
+  const onInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) processFiles(e.target.files);
+    e.target.value = "";
+  };
+
+  return (
+    <label
+      htmlFor="file-upload-input"
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+      className="relative flex flex-col items-center justify-center gap-2 w-full rounded-xl cursor-pointer transition-all duration-200 select-none"
+      style={{
+        minHeight: "120px",
+        border: isDragging
+          ? "1.5px dashed #6366f1"
+          : "1.5px dashed rgba(99,102,241,0.25)",
+        background: isDragging
+          ? "rgba(99,102,241,0.10)"
+          : "rgba(99,102,241,0.03)",
+        boxShadow: isDragging ? "0 0 24px rgba(99,102,241,0.2) inset" : "none",
+      }}
+    >
+      <input
+        id="file-upload-input"
+        type="file"
+        multiple
+        accept={ACCEPTED_EXTENSIONS.join(",")}
+        onChange={onInputChange}
+        className="sr-only"
+      />
+
+      {/* Upload Icon */}
+      <div
+        className="w-9 h-9 rounded-full flex items-center justify-center transition-all duration-200"
+        style={{
+          background: isDragging
+            ? "rgba(99,102,241,0.25)"
+            : "rgba(99,102,241,0.1)",
+        }}
+      >
+        <UploadCloud
+          className="w-4 h-4 transition-all duration-200"
+          style={{ color: isDragging ? "#818cf8" : "#6366f1" }}
+        />
+      </div>
+
+      <div className="text-center px-2">
+        <p className="text-[11px] font-medium text-forge-text-secondary">
+          {isDragging ? "Release to upload" : "Drop files here"}
+        </p>
+        <p className="text-[10px] text-forge-text-muted mt-0.5">
+          or click to browse
+        </p>
+      </div>
+
+      {/* Accepted types badge row */}
+      <div className="flex gap-1 flex-wrap justify-center px-2">
+        {["PDF", "MD", "TXT"].map((t) => (
+          <span
+            key={t}
+            className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-semibold tracking-wider"
+            style={{
+              background: "rgba(99,102,241,0.12)",
+              color: "#818cf8",
+              border: "1px solid rgba(99,102,241,0.2)",
+            }}
+          >
+            <FileText className="w-2 h-2" />
+            {t}
+          </span>
+        ))}
+      </div>
+    </label>
+  );
+}
+
+src/components/sidebar-left/leftSidebar.tsx
+
+"use client";
+
+import FileDropZone from "./FileDropZone";
+import DocumentList from "./DocumentList";
+import StorageIndicator from "./StorageIndicator";
+import type { DocumentMeta, FileItem } from "@/types";
+import { Brain } from "lucide-react";
+
+interface LeftSidebarProps {
+  documents: DocumentMeta[];
+  onFilesAdded: (items: FileItem[]) => void;
+  onRemoveDocument: (id: string) => void;
+  onClearStorage?: () => void;
+}
+
+export default function LeftSidebar({
+  documents,
+  onFilesAdded,
+  onRemoveDocument,
+  onClearStorage,
+}: LeftSidebarProps) {
+  return (
+    <aside
+      className="w-[250px] flex-shrink-0 flex flex-col h-full overflow-hidden"
+      style={{
+        background: "linear-gradient(180deg, #0f1520 0%, #0d1117 100%)",
+        borderRight: "1px solid rgba(99,102,241,0.1)",
+      }}
+    >
+      {/* Logo / Header */}
+      <div
+        className="flex items-center gap-3 px-4 py-4 flex-shrink-0"
+        style={{ borderBottom: "1px solid rgba(99,102,241,0.08)" }}
+      >
+        <div
+          className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 animate-glow-pulse"
+          style={{
+            background: "linear-gradient(135deg, #6366f1 0%, #a855f7 100%)",
+          }}
+        >
+          <Brain className="w-4 h-4 text-white" />
+        </div>
+        <div>
+          <p className="text-[11px] font-semibold tracking-[0.15em] uppercase text-forge-text-secondary">
+            MindForge
+          </p>
+          <p className="text-[9px] tracking-[0.1em] uppercase text-forge-text-muted">
+            Local · Air-Gapped
+          </p>
+        </div>
+      </div>
+
+      {/* Drop Zone */}
+      <div className="px-3 pt-4 flex-shrink-0">
+        <FileDropZone onFilesAdded={onFilesAdded} />
+      </div>
+
+      {/* Document List */}
+      <div className="flex-1 overflow-hidden flex flex-col px-3 pt-3 min-h-0">
+        <p
+          className="text-[10px] font-semibold tracking-[0.12em] uppercase mb-2 flex-shrink-0"
+          style={{ color: "#475569" }}
+        >
+          Ingested Documents
+        </p>
+        <DocumentList
+          documents={documents}
+          onRemoveDocument={onRemoveDocument}
+        />
+      </div>
+
+      {/* Storage Indicator */}
+      <div
+        className="flex-shrink-0 px-3 py-3"
+        style={{ borderTop: "1px solid rgba(99,102,241,0.08)" }}
+      >
+        <StorageIndicator onClearStorage={onClearStorage} />
+      </div>
+    </aside>
+  );
+}
+
+src/components/sidebar-left/StorageIndicator.tsx
+
+"use client";
+
+import { useEffect, useState, useCallback } from "react";
+import { Database, Trash2, Cpu } from "lucide-react";
+import { getVectorCount, subscribeVectorStore } from "@/lib/vectorStore";
+import type { StorageEstimate } from "@/types";
+
+interface StorageIndicatorProps {
+  onClearStorage?: () => void;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+}
+
+export default function StorageIndicator({ onClearStorage }: StorageIndicatorProps) {
+  const [storage, setStorage] = useState<StorageEstimate | null>(null);
+  const [vectorCount, setVectorCount] = useState<number>(0);
+  const [isClearing, setIsClearing] = useState(false);
+
+  const fetchStorage = useCallback(async () => {
+    if (navigator.storage?.estimate) {
+      const est = await navigator.storage.estimate();
+      const usage = est.usage ?? 0;
+      const quota = est.quota ?? 1;
+      setStorage({
+        usageBytes: usage,
+        quotaBytes: quota,
+        usagePercent: Math.min((usage / quota) * 100, 100),
+      });
+    }
+
+    const count = await getVectorCount();
+    setVectorCount(count);
+  }, []);
+
+  useEffect(() => {
+    fetchStorage();
+    const unsubscribe = subscribeVectorStore(() => {
+      fetchStorage();
+    });
+    const intervalId = setInterval(fetchStorage, 8_000);
+    return () => {
+      unsubscribe();
+      clearInterval(intervalId);
+    };
+  }, [fetchStorage]);
+
+  const handleClear = async () => {
+    if (isClearing) return;
+    setIsClearing(true);
+    try {
+      if (onClearStorage) {
+        await onClearStorage();
+      }
+      await fetchStorage();
+    } finally {
+      setIsClearing(false);
+    }
+  };
+
+  const pct = storage?.usagePercent ?? 0;
+  const barColor = pct > 80 ? "#f43f5e" : pct > 50 ? "#f59e0b" : "#6366f1";
+
+  return (
+    <div className="space-y-2.5">
+      {/* Header row */}
+      <div className="flex items-center gap-1.5 justify-between">
+        <div className="flex items-center gap-1.5">
+          <Database className="w-3 h-3" style={{ color: "#6366f1" }} />
+          <span
+            className="text-[10px] font-semibold tracking-[0.1em] uppercase"
+            style={{ color: "#475569" }}
+          >
+            IndexedDB / Vector DB
+          </span>
+        </div>
+        <span className="text-[10px] font-mono" style={{ color: "#94a3b8" }}>
+          {storage ? pct.toFixed(1) : "--"}%
+        </span>
+      </div>
+
+      {/* Usage Bar */}
+      <div
+        className="relative w-full h-1.5 rounded-full overflow-hidden"
+        style={{ background: "rgba(255,255,255,0.05)" }}
+      >
+        <div
+          className="absolute inset-y-0 left-0 rounded-full transition-all duration-700"
+          style={{
+            width: storage ? `${pct}%` : "0%",
+            background: `linear-gradient(90deg, ${barColor}99, ${barColor})`,
+            boxShadow: storage ? `0 0 8px ${barColor}66` : "none",
+          }}
+        />
+      </div>
+
+      {/* Vector count & Clear action row */}
+      <div className="flex items-center justify-between pt-0.5">
+        <div className="flex items-center gap-1 text-[10px]" style={{ color: "#818cf8" }}>
+          <Cpu className="w-2.5 h-2.5" />
+          <span className="font-mono font-medium">
+            {vectorCount.toLocaleString()} vector{vectorCount !== 1 ? "s" : ""}
+          </span>
+        </div>
+
+        <button
+          onClick={handleClear}
+          disabled={isClearing}
+          className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-medium transition-all duration-150 hover:bg-red-500/15 disabled:opacity-40"
+          style={{ color: "#f43f5e", border: "1px solid rgba(244,63,94,0.2)" }}
+          title="Clear vector database & IndexedDB storage"
+        >
+          <Trash2 className="w-2.5 h-2.5" />
+          Clear
+        </button>
+      </div>
+
+      {storage && (
+        <div className="flex justify-between">
+          <span className="text-[9px] font-mono" style={{ color: "#334155" }}>
+            {formatBytes(storage.usageBytes)} used
+          </span>
+          <span className="text-[9px] font-mono" style={{ color: "#334155" }}>
+            {formatBytes(storage.quotaBytes)} quota
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+---------------------------------------------------------------------------------------------------------
+
+src/components/sidebar-right/HardwareDianostics.tsx
+
+"use client";
+
+import { useEffect, useState } from "react";
+import {
+  Gpu,
+  MemoryStick,
+  Cpu,
+  Activity,
+  CheckCircle2,
+  XCircle,
+  Loader2,
+  Zap,
+  AlertTriangle,
+  Download,
+  Box,
+} from "lucide-react";
+import type { HardwareInfo } from "@/types";
+import {
+  SUPPORTED_MODELS,
+  subscribeEngineState,
+  loadModelEngine,
+  type EngineState,
+} from "@/lib/webLlmEngine";
+
+// Extend navigator type for WebGPU
+declare global {
+  interface Navigator {
+    gpu?: {
+      requestAdapter: (opts?: object) => Promise<GPUAdapter | null>;
+    };
+  }
+  interface GPUAdapter {
+    info?: {
+      vendor?: string;
+      architecture?: string;
+      device?: string;
+      description?: string;
+    };
+    requestAdapterInfo?: () => Promise<{
+      vendor?: string;
+      architecture?: string;
+      device?: string;
+      description?: string;
+    }>;
+    limits: { maxBufferSize: number; maxComputeWorkgroupSizeX: number };
+  }
+  interface Performance {
+    memory?: {
+      usedJSHeapSize: number;
+      totalJSHeapSize: number;
+      jsHeapSizeLimit: number;
+    };
+  }
+}
+
+function formatMB(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(0)} MB`;
+}
+
+function MetricRow({
+  icon,
+  label,
+  value,
+  sub,
+  accentColor = "#6366f1",
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  sub?: string;
+  accentColor?: string;
+}) {
+  return (
+    <div
+      className="flex items-start gap-3 px-3 py-2.5 rounded-xl transition-all duration-150"
+      style={{
+        background: "rgba(255,255,255,0.03)",
+        border: "1px solid rgba(255,255,255,0.05)",
+      }}
+    >
+      <div
+        className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5"
+        style={{ background: `${accentColor}1a` }}
+      >
+        <span style={{ color: accentColor }}>{icon}</span>
+      </div>
+      <div className="min-w-0 flex-1">
+        <p className="text-[10px] font-medium uppercase tracking-[0.1em]" style={{ color: "#475569" }}>
+          {label}
+        </p>
+        <p className="text-[13px] font-semibold mt-0.5 truncate" style={{ color: "#e2e8f0" }}>
+          {value}
+        </p>
+        {sub && (
+          <p className="text-[10px] mt-0.5 font-mono truncate" style={{ color: "#334155" }}>
+            {sub}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MemoryBar({ used, total, label }: { used: number; total: number; label: string }) {
+  const pct = total > 0 ? Math.min((used / total) * 100, 100) : 0;
+  const color = pct > 80 ? "#f43f5e" : pct > 55 ? "#f59e0b" : "#22d3ee";
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex justify-between items-center">
+        <span className="text-[10px] uppercase tracking-wider font-medium" style={{ color: "#475569" }}>
+          {label}
+        </span>
+        <span className="text-[10px] font-mono" style={{ color }}>
+          {pct.toFixed(1)}%
+        </span>
+      </div>
+      <div
+        className="w-full h-1.5 rounded-full overflow-hidden"
+        style={{ background: "rgba(255,255,255,0.05)" }}
+      >
+        <div
+          className="h-full rounded-full transition-all duration-700"
+          style={{
+            width: `${pct}%`,
+            background: `linear-gradient(90deg, ${color}88, ${color})`,
+            boxShadow: `0 0 6px ${color}55`,
+          }}
+        />
+      </div>
+      <div className="flex justify-between">
+        <span className="text-[9px] font-mono" style={{ color: "#334155" }}>
+          {formatMB(used)}
+        </span>
+        <span className="text-[9px] font-mono" style={{ color: "#334155" }}>
+          {formatMB(total)}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+export default function HardwareDiagnostics() {
+  const [hw, setHw] = useState<HardwareInfo>({ webgpuStatus: "checking" });
+  const [engineState, setEngineState] = useState<EngineState>({
+    status: "unloaded",
+    selectedModelId: SUPPORTED_MODELS[0].id,
+    progress: 0,
+    progressText: "",
+    errorMessage: null,
+  });
+
+  useEffect(() => {
+    const unsubscribe = subscribeEngineState(setEngineState);
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    const probe = async () => {
+      if (!navigator.gpu) {
+        setHw((p) => ({ ...p, webgpuStatus: "unsupported" }));
+        return;
+      }
+
+      try {
+        const adapter = await navigator.gpu.requestAdapter({
+          powerPreference: "high-performance",
+        });
+
+        if (!adapter) {
+          setHw((p) => ({ ...p, webgpuStatus: "unsupported" }));
+          return;
+        }
+
+        let adapterInfo = adapter.info;
+        if (!adapterInfo && adapter.requestAdapterInfo) {
+          adapterInfo = await adapter.requestAdapterInfo();
+        }
+
+        const estimatedVRAMMB = Math.round(adapter.limits.maxBufferSize / (1024 * 1024));
+
+        setHw((p) => ({
+          ...p,
+          webgpuStatus: "supported",
+          adapterInfo: {
+            vendor: adapterInfo?.vendor || "Unknown",
+            architecture: adapterInfo?.architecture || "Unknown",
+            device: adapterInfo?.device || "Unknown",
+            description: adapterInfo?.description || "WebGPU Adapter",
+          },
+          estimatedVRAMMB,
+          backend: "WebGPU",
+        }));
+      } catch {
+        setHw((p) => ({ ...p, webgpuStatus: "error" }));
+      }
+    };
+
+    probe();
+
+    const refreshHeap = () => {
+      const mem = (performance as Performance).memory;
+      if (mem) {
+        setHw((p) => ({
+          ...p,
+          usedJSHeapMB: mem.usedJSHeapSize,
+          totalJSHeapMB: mem.totalJSHeapSize,
+          jsHeapLimitMB: mem.jsHeapSizeLimit,
+        }));
+      }
+    };
+    refreshHeap();
+    const id = setInterval(refreshHeap, 2000);
+    return () => clearInterval(id);
+  }, []);
+
+  const handleStartLoad = () => {
+    loadModelEngine(engineState.selectedModelId).catch(() => {});
+  };
+
+  const selectedModelSpec = SUPPORTED_MODELS.find((m) => m.id === engineState.selectedModelId);
+
+  const statusColor = {
+    checking: "#f59e0b",
+    supported: "#22d3ee",
+    unsupported: "#f43f5e",
+    error: "#f43f5e",
+  }[hw.webgpuStatus];
+
+  const StatusIcon =
+    hw.webgpuStatus === "checking"
+      ? Loader2
+      : hw.webgpuStatus === "supported"
+      ? CheckCircle2
+      : XCircle;
+
+  return (
+    <div className="space-y-3 animate-fade-in-up">
+      {/* Fallback Banner if WebGPU is unsupported */}
+      {hw.webgpuStatus === "unsupported" && (
+        <div
+          className="rounded-xl p-3 space-y-1.5"
+          style={{
+            background: "rgba(244, 63, 94, 0.1)",
+            border: "1px solid rgba(244, 63, 94, 0.3)",
+          }}
+        >
+          <div className="flex items-center gap-1.5" style={{ color: "#f43f5e" }}>
+            <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+            <span className="text-[11px] font-bold uppercase tracking-wider">
+              WebGPU Unsupported
+            </span>
+          </div>
+          <p className="text-[10px] leading-relaxed" style={{ color: "#f87171" }}>
+            Local LLM inference requires WebGPU (Chrome 113+ or Edge 113+). Document vector ingestion and RAG search will operate in fallback mode.
+          </p>
+        </div>
+      )}
+
+      {/* WebGPU Status Card */}
+      <div
+        className="rounded-xl p-3 space-y-2"
+        style={{
+          background: "rgba(99,102,241,0.05)",
+          border: `1px solid ${statusColor}33`,
+        }}
+      >
+        <div className="flex items-center gap-2">
+          <div className="relative flex items-center justify-center w-6 h-6">
+            {hw.webgpuStatus === "supported" && (
+              <span
+                className="absolute w-6 h-6 rounded-full animate-pulse-ring"
+                style={{ background: `${statusColor}40` }}
+              />
+            )}
+            <StatusIcon
+              className={`w-4 h-4 ${hw.webgpuStatus === "checking" ? "animate-spin" : ""}`}
+              style={{ color: statusColor }}
+            />
+          </div>
+          <span className="text-[12px] font-semibold" style={{ color: statusColor }}>
+            WebGPU{" "}
+            {hw.webgpuStatus === "checking"
+              ? "Probing…"
+              : hw.webgpuStatus === "supported"
+              ? "Active"
+              : "Not Available"}
+          </span>
+        </div>
+
+        {hw.adapterInfo && (
+          <div className="space-y-1 pl-8">
+            <p className="text-[11px] font-medium" style={{ color: "#94a3b8" }}>
+              {hw.adapterInfo.description !== "WebGPU Adapter"
+                ? hw.adapterInfo.description
+                : hw.adapterInfo.vendor !== "Unknown"
+                ? hw.adapterInfo.vendor
+                : "Hardware GPU"}
+            </p>
+            {hw.adapterInfo.architecture !== "Unknown" && (
+              <p className="text-[10px] font-mono" style={{ color: "#475569" }}>
+                {hw.adapterInfo.architecture}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* WebLLM Local Model Loader Panel */}
+      <div
+        className="rounded-xl p-3 space-y-2.5"
+        style={{
+          background: "rgba(255,255,255,0.02)",
+          border: "1px solid rgba(99,102,241,0.15)",
+        }}
+      >
+        <div className="flex items-center gap-2">
+          <Box className="w-3.5 h-3.5" style={{ color: "#818cf8" }} />
+          <span className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: "#cbd5e1" }}>
+            Local LLM Model
+          </span>
+        </div>
+
+        {/* Model Selector */}
+        <select
+          value={engineState.selectedModelId}
+          disabled={engineState.status === "loading"}
+          onChange={(e) => {
+            setEngineState((prev) => ({ ...prev, selectedModelId: e.target.value }));
+          }}
+          className="w-full bg-[#0d1117] text-[11px] rounded-lg px-2.5 py-1.5 outline-none font-medium transition-colors"
+          style={{
+            border: "1px solid rgba(99,102,241,0.25)",
+            color: "#e2e8f0",
+          }}
+        >
+          {SUPPORTED_MODELS.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.name} ({m.vramMB}MB VRAM)
+            </option>
+          ))}
+        </select>
+
+        {selectedModelSpec && (
+          <p className="text-[9px]" style={{ color: "#475569" }}>
+            {selectedModelSpec.description}
+          </p>
+        )}
+
+        {/* Load Button / Progress Status */}
+        {engineState.status === "unloaded" && (
+          <button
+            onClick={handleStartLoad}
+            disabled={hw.webgpuStatus !== "supported"}
+            className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg text-[11px] font-semibold transition-all duration-150 disabled:opacity-30"
+            style={{
+              background: "linear-gradient(135deg, #6366f1 0%, #a855f7 100%)",
+              color: "#ffffff",
+              boxShadow: "0 0 12px rgba(99,102,241,0.25)",
+            }}
+          >
+            <Download className="w-3 h-3" />
+            Load Model into WebGPU
+          </button>
+        )}
+
+        {engineState.status === "loading" && (
+          <div className="space-y-1.5 pt-1">
+            <div className="flex justify-between items-center">
+              <span className="text-[9px] font-mono truncate max-w-[170px]" style={{ color: "#818cf8" }}>
+                {engineState.progressText}
+              </span>
+              <span className="text-[9px] font-mono font-bold" style={{ color: "#a855f7" }}>
+                {engineState.progress}%
+              </span>
+            </div>
+            <div
+              className="w-full h-1.5 rounded-full overflow-hidden"
+              style={{ background: "rgba(255,255,255,0.06)" }}
+            >
+              <div
+                className="h-full rounded-full transition-all duration-300"
+                style={{
+                  width: `${engineState.progress}%`,
+                  background: "linear-gradient(90deg, #6366f1, #a855f7)",
+                  boxShadow: "0 0 8px rgba(168,85,247,0.5)",
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        {engineState.status === "ready" && (
+          <div
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg"
+            style={{
+              background: "rgba(34, 211, 238, 0.1)",
+              border: "1px solid rgba(34, 211, 238, 0.25)",
+            }}
+          >
+            <CheckCircle2 className="w-3.5 h-3.5" style={{ color: "#22d3ee" }} />
+            <span className="text-[11px] font-medium" style={{ color: "#22d3ee" }}>
+              Model Loaded & Cached
+            </span>
+          </div>
+        )}
+
+        {engineState.status === "error" && (
+          <div className="space-y-1">
+            <div
+              className="flex items-center gap-1.5 px-2 py-1 rounded text-[10px]"
+              style={{ background: "rgba(244,63,94,0.1)", color: "#f43f5e" }}
+            >
+              <XCircle className="w-3 h-3 flex-shrink-0" />
+              <span className="truncate">{engineState.errorMessage || "Load error"}</span>
+            </div>
+            <button
+              onClick={handleStartLoad}
+              className="text-[9px] underline font-medium"
+              style={{ color: "#818cf8" }}
+            >
+              Retry Load
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Metric rows */}
+      <div className="space-y-2">
+        <MetricRow
+          icon={<Gpu className="w-3.5 h-3.5" />}
+          label="Backend"
+          value={hw.backend ?? "—"}
+          accentColor="#6366f1"
+        />
+
+        <MetricRow
+          icon={<Zap className="w-3.5 h-3.5" />}
+          label="Est. VRAM Budget"
+          value={hw.estimatedVRAMMB ? `${hw.estimatedVRAMMB} MB` : "—"}
+          sub="maxBufferSize limit"
+          accentColor="#a855f7"
+        />
+
+        <MetricRow
+          icon={<Cpu className="w-3.5 h-3.5" />}
+          label="JS Heap Used"
+          value={hw.usedJSHeapMB ? formatMB(hw.usedJSHeapMB) : "—"}
+          sub="Chrome only"
+          accentColor="#22d3ee"
+        />
+
+        <MetricRow
+          icon={<MemoryStick className="w-3.5 h-3.5" />}
+          label="Heap Limit"
+          value={hw.jsHeapLimitMB ? formatMB(hw.jsHeapLimitMB) : "—"}
+          accentColor="#38bdf8"
+        />
+      </div>
+
+      {/* Memory Bars */}
+      {hw.usedJSHeapMB && hw.totalJSHeapMB ? (
+        <div
+          className="rounded-xl p-3 space-y-3"
+          style={{
+            background: "rgba(255,255,255,0.02)",
+            border: "1px solid rgba(255,255,255,0.04)",
+          }}
+        >
+          <div className="flex items-center gap-1.5 mb-3">
+            <Activity className="w-3 h-3" style={{ color: "#22d3ee" }} />
+            <span className="text-[10px] font-semibold uppercase tracking-[0.1em]" style={{ color: "#475569" }}>
+              Memory Load
+            </span>
+          </div>
+          <MemoryBar
+            used={hw.usedJSHeapMB}
+            total={hw.totalJSHeapMB}
+            label="JS Heap (used / total)"
+          />
+          {hw.jsHeapLimitMB && (
+            <MemoryBar
+              used={hw.totalJSHeapMB}
+              total={hw.jsHeapLimitMB}
+              label="Heap (total / limit)"
+            />
+          )}
+        </div>
+      ) : null}
+
+      {/* Footer note */}
+      <p className="text-[9px] text-center pb-1" style={{ color: "#1e2a3d" }}>
+        All compute stays local · Zero cloud calls
+      </p>
+    </div>
+  );
+}
+
+src/components/sidebar-right/RightSidebar.tsx
+
+"use client";
+
+import HardwareDiagnostics from "./HardwareDiagnostics";
+import { Settings2 } from "lucide-react";
+
+export default function RightSidebar() {
+  return (
+    <aside
+      className="w-[300px] flex-shrink-0 flex flex-col h-full overflow-hidden"
+      style={{
+        background: "linear-gradient(180deg, #0f1520 0%, #0d1117 100%)",
+        borderLeft: "1px solid rgba(99,102,241,0.1)",
+      }}
+    >
+      {/* Header */}
+      <div
+        className="flex items-center gap-2 px-4 py-4 flex-shrink-0"
+        style={{ borderBottom: "1px solid rgba(99,102,241,0.08)" }}
+      >
+        <Settings2 className="w-4 h-4" style={{ color: "#6366f1" }} />
+        <span className="text-[11px] font-semibold tracking-[0.12em] uppercase" style={{ color: "#475569" }}>
+          Hardware Diagnostics
+        </span>
+      </div>
+
+      {/* Content */}
+      <div className="flex-1 overflow-y-auto px-3 py-3">
+        <HardwareDiagnostics />
+      </div>
+    </aside>
+  );
+}
+
+-----------------------------------------------------------------------------------------------------
+
+src/app/globals.css
+
+@import "tailwindcss";
+
+/* ── Tailwind v4 class-based dark mode ─────────────────────────────── */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ── Forge Design Tokens ────────────────────────────────────────────── */
+@theme inline {
+  /* Backgrounds */
+  --color-forge-void:    #070a12;
+  --color-forge-base:    #0d1117;
+  --color-forge-surface: #111827;
+  --color-forge-panel:   #161d2e;
+  --color-forge-elevated:#1e2a3d;
+
+  /* Borders */
+  --color-forge-border:  #1f2d45;
+  --color-forge-border-subtle: rgba(255,255,255,0.05);
+
+  /* Accent — electric indigo */
+  --color-forge-accent:  #6366f1;
+  --color-forge-accent-bright: #818cf8;
+  --color-forge-accent-dim: #3730a3;
+  --color-forge-glow:    rgba(99,102,241,0.35);
+
+  /* Status */
+  --color-forge-success: #22d3ee;
+  --color-forge-warning: #f59e0b;
+  --color-forge-error:   #f43f5e;
+
+  /* Text */
+  --color-forge-text-primary:   #e2e8f0;
+  --color-forge-text-secondary: #94a3b8;
+  --color-forge-text-muted:     #475569;
+
+  /* Fonts */
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-geist-mono);
+}
+
+/* ── Base Styles ─────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  height: 100%;
+  background-color: #070a12;
+}
+
+body {
+  height: 100%;
+  background-color: #070a12;
+  color: #e2e8f0;
+  font-family: var(--font-inter), system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#__next,
+[data-nextjs-root-layout] > body > div {
+  height: 100%;
+}
+
+/* ── Custom Scrollbars ───────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #1f2d45;
+  border-radius: 99px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #6366f1;
+}
+
+/* ── Animations ─────────────────────────────────────────────────────── */
+@keyframes pulse-ring {
+  0%   { transform: scale(0.8); opacity: 1; }
+  100% { transform: scale(2.0); opacity: 0; }
+}
+
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position:  200% 0; }
+}
+
+@keyframes spin-slow {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes glow-pulse {
+  0%, 100% { box-shadow: 0 0 8px rgba(99,102,241,0.3); }
+  50%       { box-shadow: 0 0 24px rgba(99,102,241,0.7); }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0px); }
+  50%       { transform: translateY(-6px); }
+}
+
+.animate-pulse-ring {
+  animation: pulse-ring 1.5s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
+}
+.animate-fade-in-up {
+  animation: fade-in-up 0.4s ease both;
+}
+.animate-shimmer {
+  background: linear-gradient(90deg, #1f2d45 25%, #2d3f5e 50%, #1f2d45 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.8s infinite;
+}
+.animate-spin-slow {
+  animation: spin-slow 8s linear infinite;
+}
+.animate-glow-pulse {
+  animation: glow-pulse 2s ease-in-out infinite;
+}
+.animate-float {
+  animation: float 3s ease-in-out infinite;
+}
+
+/* ── Glass Morphism Utility ─────────────────────────────────────────── */
+.glass {
+  background: rgba(17, 24, 39, 0.6);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(99, 102, 241, 0.12);
+}
+
+.glass-subtle {
+  background: rgba(13, 17, 23, 0.8);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+/* ── Gradient Text ──────────────────────────────────────────────────── */
+.gradient-text {
+  background: linear-gradient(135deg, #818cf8 0%, #c084fc 50%, #38bdf8 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ── Tab Indicator ──────────────────────────────────────────────────── */
+.forge-tab-active {
+  background: linear-gradient(135deg, rgba(99,102,241,0.2) 0%, rgba(168,85,247,0.1) 100%);
+  border: 1px solid rgba(99,102,241,0.4);
+  color: #818cf8;
+}
+.forge-tab-inactive {
+  background: transparent;
+  border: 1px solid transparent;
+  color: #475569;
+}
+.forge-tab-inactive:hover {
+  color: #94a3b8;
+  background: rgba(255,255,255,0.04);
+  border-color: rgba(255,255,255,0.06);
+}
+
+
+src/app/layout.tsx
+
+import type { Metadata } from "next";
+import { Inter, Geist_Mono } from "next/font/google";
+import "./globals.css";
+
+const inter = Inter({
+  variable: "--font-inter",
+  subsets: ["latin"],
+  display: "swap",
+});
+
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
+  subsets: ["latin"],
+  display: "swap",
+});
+
+export const metadata: Metadata = {
+  title: "MindForge Local — Air-Gapped Knowledge Graph & RAG Engine",
+  description:
+    "100% client-side knowledge graph and RAG search engine running entirely in your browser. Powered by WebGPU, WebLLM, and Transformers.js — zero cloud, zero API costs.",
+  keywords: ["knowledge graph", "RAG", "WebGPU", "LLM", "browser AI", "local AI"],
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html
+      lang="en"
+      className={`dark ${inter.variable} ${geistMono.variable} h-full`}
+      suppressHydrationWarning
+    >
+      <body className="h-full min-h-screen overflow-hidden antialiased" suppressHydrationWarning>
+        {children}
+      </body>
+    </html>
+  );
+}
+
+
+src/app/page.tsx
+
+import Dashboard from "@/components/dashboard/Dashboard";
+
+export default function Home() {
+  return <Dashboard />;
+}
+
