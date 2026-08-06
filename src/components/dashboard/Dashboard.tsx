@@ -3,17 +3,26 @@
 import LeftSidebar from "@/components/sidebar-left/LeftSidebar";
 import CenterView, { type Tab } from "@/components/center/CenterView";
 import RightSidebar from "@/components/sidebar-right/RightSidebar";
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { useIngestionPipeline } from "@/hooks/useIngestionPipeline";
 import { removeDocChunks, savePersistedDocuments } from "@/lib/vectorStore";
 import type { DocumentMeta, FileItem } from "@/types";
-import { FolderOpen, Network, MessageSquareText, Cpu, Brain } from "lucide-react";
+import { FolderOpen, Network, MessageSquareText, Cpu, Brain, Monitor } from "lucide-react";
 
 export default function Dashboard() {
   const [documents, setDocuments] = useState<DocumentMeta[]>([]);
   const [isMobileLeftOpen, setIsMobileLeftOpen] = useState(false);
   const [isMobileRightOpen, setIsMobileRightOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>("mesh");
+  const [isMobileDevice, setIsMobileDevice] = useState(false);
+
+  useEffect(() => {
+    const isMobile =
+      /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+        navigator.userAgent
+      ) || window.innerWidth < 768;
+    setIsMobileDevice(isMobile);
+  }, []);
 
   const updateDocument = useCallback(
     (id: string, patch: Partial<DocumentMeta>) => {
@@ -60,6 +69,49 @@ export default function Dashboard() {
     await purgeAllStorage();
     setDocuments([]);
   }, [purgeAllStorage]);
+
+  if (isMobileDevice) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen w-full bg-[#030712] p-6 text-center space-y-6 relative overflow-hidden">
+        {/* Ambient background glow */}
+        <div className="absolute w-[350px] h-[350px] bg-indigo-600/10 rounded-full blur-[120px] pointer-events-none" />
+
+        {/* Brand Icon Badge */}
+        <div className="w-16 h-16 rounded-2xl flex items-center justify-center btn-cyber-primary shadow-[0_0_30px_rgba(99,102,241,0.3)] z-10">
+          <Brain className="w-8 h-8 text-white" />
+        </div>
+
+        {/* Brand Title */}
+        <div className="space-y-1 z-10">
+          <h1 className="text-xl font-extrabold tracking-wider uppercase text-gradient-bold">
+            MindForge Local
+          </h1>
+          <p className="text-[10px] font-mono tracking-widest uppercase text-cyan-400 font-semibold">
+            100% Client-Side · Air-Gapped AI Engine
+          </p>
+        </div>
+
+        {/* Formal Mobile Notice Card */}
+        <div className="cyber-panel p-6 rounded-2xl border border-indigo-500/20 max-w-sm space-y-3.5 shadow-2xl z-10 bg-slate-950/80 backdrop-blur-md">
+          <div className="flex items-center justify-center gap-2 text-amber-400 font-bold text-xs uppercase tracking-wider">
+            <Monitor className="w-4 h-4" />
+            <span>Desktop Hardware Required</span>
+          </div>
+          <p className="text-xs text-slate-300 leading-relaxed font-sans">
+            MindForge Local is engineered specifically for desktop and laptop hardware, utilizing high-throughput WebGPU compute pipelines, multithreaded vector indexing, and 3D WebGL visualization.
+          </p>
+          <div className="pt-3 border-t border-indigo-500/15 text-[11px] text-slate-400">
+            Please open this application on your **Desktop or Laptop PC** to access full system capabilities.
+          </div>
+        </div>
+
+        {/* Supported Browsers Specs */}
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-900/80 border border-white/10 text-[10px] font-mono text-slate-400 z-10">
+          <span>Supported: Chrome / Edge / Brave (Windows, macOS, Linux)</span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col md:flex-row h-screen w-full overflow-hidden bg-forge-void relative">

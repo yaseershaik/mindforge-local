@@ -115,10 +115,10 @@ export default function KnowledgeMesh({
         <div className="flex flex-col items-center justify-center gap-3 p-4 z-10 text-center">
           <Network className="w-10 h-10 text-cyan-400" />
           <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider">
-            Concept Node Overview (Mobile Mode)
+            Concept Node Overview
           </h3>
           <p className="text-[10px] text-slate-400 max-w-[260px]">
-            WebGL 3D animated canvas paused to conserve mobile hardware resources (Minimum 4GB RAM required).
+            Interactive 2D concept canvas mode.
           </p>
           <div className="flex flex-wrap justify-center gap-2 max-w-[300px] mt-2 max-h-[220px] overflow-y-auto">
             {graphData.nodes.map((n) => (
