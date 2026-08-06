@@ -15,9 +15,9 @@ export interface ModelSpec {
 
 export const SUPPORTED_MODELS: ModelSpec[] = [
   {
-    id: "SmolLM2-360M-Instruct-q4f16_1-MLC",
+    id: "SmolLM2-360M-Instruct-q0f16-MLC",
     name: "SmolLM2 360M (Ultra Fast )",
-    vramMB: 376,
+    vramMB: 872,
     description: "Ultra-lightweight model optimized for low VRAM GPUs",
     isRecommended: true,
   },
