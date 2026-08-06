@@ -33,12 +33,8 @@ export default function KnowledgeMesh({
       navigator.userAgent
     ) || window.innerWidth < 768;
 
-    // Detect device RAM in GB (only available on Chromium browsers).
-    // If undefined (e.g. iOS Safari), default to 4GB to allow newer iPhones to run it.
-    const deviceMemory = (navigator as any).deviceMemory || 4;
-    
-    // Only show the lightweight fallback if it's a mobile device AND has less than 4GB RAM
-    setIsMobileDevice(isMobile && deviceMemory < 4);
+    // Always use lightweight 2D fallback on mobile devices to prevent WebGL canvas crashes
+    setIsMobileDevice(isMobile);
 
     const handleResize = () => {
       if (containerRef.current) {

@@ -3,6 +3,8 @@
 import dynamic from "next/dynamic";
 import { Loader2 } from "lucide-react";
 
+import ErrorBoundary from "@/components/common/ErrorBoundary";
+
 // Dynamically import Dashboard with SSR disabled to prevent Node.js build errors
 const Dashboard = dynamic(() => import("@/components/dashboard/Dashboard"), {
   ssr: false,
@@ -15,5 +17,9 @@ const Dashboard = dynamic(() => import("@/components/dashboard/Dashboard"), {
 });
 
 export default function Home() {
-  return <Dashboard />;
+  return (
+    <ErrorBoundary fallbackText="Application Recovered">
+      <Dashboard />
+    </ErrorBoundary>
+  );
 }
