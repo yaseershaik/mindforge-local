@@ -15,6 +15,7 @@ import {
   Square,
   Zap,
   Trash2,
+  AlertTriangle,
 } from "lucide-react";
 import type { ChatMessage, DocumentMeta, VectorSearchResult } from "@/types";
 import {
@@ -308,7 +309,7 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
 
   return (
     <div className="flex flex-col h-full bg-[#030712]">
-      <div className="flex items-center gap-3 px-5 py-3 flex-shrink-0 cyber-panel border-b border-indigo-500/20">
+      <div className="flex flex-wrap items-center gap-2 md:gap-3 px-3 md:px-5 py-2 md:py-3 flex-shrink-0 cyber-panel border-b border-indigo-500/20">
         <div className="flex items-center gap-2">
           <Zap className="w-4 h-4 text-cyan-400 animate-pulse" />
           <span className="text-xs font-bold uppercase tracking-wider text-gradient-bold">
@@ -351,6 +352,12 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
           >
             <Download className="w-3 h-3" /> Load Model
           </button>
+        )}
+
+        {engineState.status === "error" && (
+          <span className="flex items-center gap-1.5 text-[11px] px-2.5 py-0.5 rounded-full font-medium text-rose-400 bg-rose-500/10 border border-rose-500/30" title={engineState.errorMessage || "Unknown error"}>
+            <AlertTriangle className="w-3 h-3" /> Error Loading
+          </span>
         )}
 
         <button

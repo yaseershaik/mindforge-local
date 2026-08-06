@@ -115,18 +115,18 @@ export default function Dashboard() {
       )}
 
       {/* Mobile Bottom Navigation Bar */}
-      <div className="md:hidden flex items-center justify-around bg-slate-900 border-t border-indigo-500/20 pb-4 pt-2 px-2 z-40 shadow-[0_-4px_20px_rgba(0,0,0,0.3)]">
+      <div className="md:hidden flex items-center justify-around bg-slate-900 border-t border-indigo-500/20 pb-2 pt-1.5 px-2 z-40 shadow-[0_-4px_20px_rgba(0,0,0,0.3)]">
         <button
           onClick={() => {
             setIsMobileLeftOpen(true);
             setIsMobileRightOpen(false);
           }}
-          className={`flex flex-col items-center gap-1 p-2 transition-colors ${
+          className={`flex flex-col items-center gap-0.5 p-1.5 transition-colors ${
             isMobileLeftOpen ? "text-cyan-400" : "text-slate-400 hover:text-slate-300"
           }`}
         >
-          <FolderOpen className="w-5 h-5" />
-          <span className="text-[10px] font-semibold tracking-wide">Docs</span>
+          <FolderOpen className="w-4 h-4" />
+          <span className="text-[9px] font-semibold tracking-wide">Docs</span>
         </button>
 
         <button
@@ -135,14 +135,14 @@ export default function Dashboard() {
             setIsMobileLeftOpen(false);
             setIsMobileRightOpen(false);
           }}
-          className={`flex flex-col items-center gap-1 p-2 transition-colors ${
+          className={`flex flex-col items-center gap-0.5 p-1.5 transition-colors ${
             !isMobileLeftOpen && !isMobileRightOpen && activeTab === "mesh"
               ? "text-cyan-400"
               : "text-slate-400 hover:text-slate-300"
           }`}
         >
-          <Network className="w-5 h-5" />
-          <span className="text-[10px] font-semibold tracking-wide">Mesh</span>
+          <Network className="w-4 h-4" />
+          <span className="text-[9px] font-semibold tracking-wide">Mesh</span>
         </button>
 
         <button
@@ -151,14 +151,14 @@ export default function Dashboard() {
             setIsMobileLeftOpen(false);
             setIsMobileRightOpen(false);
           }}
-          className={`flex flex-col items-center gap-1 p-2 transition-colors ${
+          className={`flex flex-col items-center gap-0.5 p-1.5 transition-colors ${
             !isMobileLeftOpen && !isMobileRightOpen && activeTab === "chat"
               ? "text-cyan-400"
               : "text-slate-400 hover:text-slate-300"
           }`}
         >
-          <MessageSquareText className="w-5 h-5" />
-          <span className="text-[10px] font-semibold tracking-wide">Chat</span>
+          <MessageSquareText className="w-4 h-4" />
+          <span className="text-[9px] font-semibold tracking-wide">Chat</span>
         </button>
 
         <button
@@ -166,12 +166,12 @@ export default function Dashboard() {
             setIsMobileRightOpen(true);
             setIsMobileLeftOpen(false);
           }}
-          className={`flex flex-col items-center gap-1 p-2 transition-colors ${
+          className={`flex flex-col items-center gap-0.5 p-1.5 transition-colors ${
             isMobileRightOpen ? "text-cyan-400" : "text-slate-400 hover:text-slate-300"
           }`}
         >
-          <Cpu className="w-5 h-5" />
-          <span className="text-[10px] font-semibold tracking-wide">System</span>
+          <Cpu className="w-4 h-4" />
+          <span className="text-[9px] font-semibold tracking-wide">System</span>
         </button>
       </div>
     </div>
