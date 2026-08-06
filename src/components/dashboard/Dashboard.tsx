@@ -7,7 +7,7 @@ import { useState, useCallback } from "react";
 import { useIngestionPipeline } from "@/hooks/useIngestionPipeline";
 import { removeDocChunks, savePersistedDocuments } from "@/lib/vectorStore";
 import type { DocumentMeta, FileItem } from "@/types";
-import { FolderOpen, Network, MessageSquareText, Cpu } from "lucide-react";
+import { FolderOpen, Network, MessageSquareText, Cpu, Brain } from "lucide-react";
 
 export default function Dashboard() {
   const [documents, setDocuments] = useState<DocumentMeta[]>([]);
@@ -63,11 +63,26 @@ export default function Dashboard() {
 
   return (
     <div className="flex flex-col md:flex-row h-screen w-full overflow-hidden bg-forge-void relative">
-      {/* Mobile Top Header (Branding Only) */}
-      <div className="md:hidden flex items-center justify-center px-4 py-3 bg-slate-900 border-b border-indigo-500/20 z-20 shadow-sm">
-        <span className="text-[13px] font-extrabold uppercase tracking-widest text-gradient-bold">
-          MindForge Local
-        </span>
+      {/* Mobile Top Header (Premium Glassmorphic Cyber Header) */}
+      <div className="md:hidden flex items-center justify-between px-4 py-2.5 bg-slate-950/80 backdrop-blur-md border-b border-indigo-500/20 z-20 shadow-md">
+        <div className="flex items-center gap-2.5">
+          <div className="w-7 h-7 rounded-lg flex items-center justify-center btn-cyber-primary shadow-[0_0_10px_rgba(99,102,241,0.4)]">
+            <Brain className="w-3.5 h-3.5 text-white" />
+          </div>
+          <div className="flex flex-col">
+            <span className="text-[12px] font-extrabold uppercase tracking-wider text-gradient-bold leading-tight">
+              MindForge
+            </span>
+            <span className="text-[9px] font-mono tracking-widest uppercase text-cyan-400 font-semibold leading-tight">
+              Local AI Engine
+            </span>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/25 text-[10px] font-mono text-cyan-300">
+          <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
+          {documents.length > 0 ? `${documents.length} DOC${documents.length > 1 ? "S" : ""}` : "AIR-GAPPED"}
+        </div>
       </div>
 
       {/* Left Sidebar Drawer */}
