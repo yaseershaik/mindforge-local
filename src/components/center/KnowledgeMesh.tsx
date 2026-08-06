@@ -33,7 +33,12 @@ export default function KnowledgeMesh({
       navigator.userAgent
     ) || window.innerWidth < 768;
 
-    setIsMobileDevice(isMobile);
+    // Detect device RAM in GB (only available on Chromium browsers).
+    // If undefined (e.g. iOS Safari), default to 4GB to allow newer iPhones to run it.
+    const deviceMemory = (navigator as any).deviceMemory || 4;
+    
+    // Only show the lightweight fallback if it's a mobile device AND has less than 4GB RAM
+    setIsMobileDevice(isMobile && deviceMemory < 4);
 
     const handleResize = () => {
       if (containerRef.current) {
@@ -117,7 +122,7 @@ export default function KnowledgeMesh({
             Concept Node Overview (Mobile Mode)
           </h3>
           <p className="text-[10px] text-slate-400 max-w-[260px]">
-            WebGL 3D animated canvas paused to conserve mobile hardware resources.
+            WebGL 3D animated canvas paused to conserve mobile hardware resources (Minimum 4GB RAM required).
           </p>
           <div className="flex flex-wrap justify-center gap-2 max-w-[300px] mt-2 max-h-[220px] overflow-y-auto">
             {graphData.nodes.map((n) => (
