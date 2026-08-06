@@ -15,11 +15,17 @@ export interface ModelSpec {
 
 export const SUPPORTED_MODELS: ModelSpec[] = [
   {
-    id: "SmolLM2-360M-Instruct-q0f16-MLC",
-    name: "SmolLM2 360M (Ultra Fast )",
-    vramMB: 872,
-    description: "Ultra-lightweight model optimized for low VRAM GPUs",
+    id: "SmolLM2-135M-Instruct-q0f16-MLC",
+    name: "SmolLM2 135M (Nano)",
+    vramMB: 360,
+    description: "Ultra-tiny 360MB model for strict mobile limits (Requires f16 GPU support)",
     isRecommended: true,
+  },
+  {
+    id: "SmolLM2-360M-Instruct-q4f32_1-MLC",
+    name: "SmolLM2 360M (Universal Mobile)",
+    vramMB: 580,
+    description: "Universal fallback model optimized for all mobiles (No f16 requirement)",
   },
   {
     id: "Llama-3.2-1B-Instruct-q4f16_1-MLC",
