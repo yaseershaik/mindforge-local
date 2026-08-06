@@ -147,3 +147,19 @@ body::before {
 .btn-cyber-stop:hover {
   box-shadow: 0 0 25px rgba(225, 29, 72, 0.8);
 }
+
+/* ── Entrance Animations ────────────────────────────────────────── */
+@keyframes fade-in-up {
+  0% {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 0.35s ease-out both;
+}

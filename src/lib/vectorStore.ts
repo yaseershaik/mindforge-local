@@ -14,7 +14,7 @@ const STORE_ORAMA = "orama_snapshot";
 const STORE_DOCS = "documents_meta";
 
 let dbInstance: AnyOrama | null = null;
-let listeners: Array<() => void> = [];
+let listeners: Array<(count: number) => void> = [];
 
 // ── IndexedDB Helpers ──────────────────────────────────────────────────────
 
@@ -132,14 +132,20 @@ async function createOramaSchema(): Promise<AnyOrama> {
   });
 }
 
-function notifyStoreChanged() {
-  listeners.forEach((fn) => fn());
+async function notifyStoreChanged() {
+  const currentCount = dbInstance ? await count(dbInstance) : 0;
+  listeners.forEach((fn) => fn(currentCount));
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
-export function subscribeVectorStore(listener: () => void): () => void {
+export function subscribeVectorStore(listener: (count: number) => void): () => void {
   listeners.push(listener);
+  // Immediately notify with current count
+  (async () => {
+    const currentCount = dbInstance ? await count(dbInstance) : 0;
+    listener(currentCount);
+  })();
   return () => {
     listeners = listeners.filter((l) => l !== listener);
   };

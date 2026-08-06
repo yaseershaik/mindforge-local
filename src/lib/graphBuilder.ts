@@ -41,12 +41,18 @@ export interface Graph3DData {
  * Computes cosine similarity between two normalized 384-dim vectors (dot product)
  */
 export function computeCosineSimilarity(vecA: number[], vecB: number[]): number {
-  if (vecA.length !== vecB.length) return 0;
+  if (vecA.length !== vecB.length || vecA.length === 0) return 0;
   let dot = 0;
+  let magA = 0;
+  let magB = 0;
   for (let i = 0; i < vecA.length; i++) {
     dot += vecA[i] * vecB[i];
+    magA += vecA[i] * vecA[i];
+    magB += vecB[i] * vecB[i];
   }
-  return dot;
+  const magnitude = Math.sqrt(magA) * Math.sqrt(magB);
+  if (magnitude === 0) return 0;
+  return dot / magnitude;
 }
 
 /**

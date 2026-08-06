@@ -159,13 +159,13 @@ const WELCOME_MESSAGE: ExtendedChatMessage = {
 export default function AgentChat({ documents, initialPrompt }: AgentChatProps) {
   const [messages, setMessages] = useState<ExtendedChatMessage[]>([WELCOME_MESSAGE]);
   const [input, setInput] = useState("");
-  const [engineState, setEngineState] = useState<EngineState & { isGenerating?: boolean }>({
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [engineState, setEngineState] = useState<EngineState>({
     status: "unloaded",
     selectedModelId: SUPPORTED_MODELS[0].id,
     progress: 0,
     progressText: "",
     errorMessage: null,
-    isGenerating: false,
   });
 
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -179,6 +179,13 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
   useEffect(() => {
     const unsubscribe = subscribeEngineState(setEngineState);
     return () => unsubscribe();
+  }, []);
+
+  // Cleanup: stop any in-flight generation on unmount
+  useEffect(() => {
+    return () => {
+      stopGeneration();
+    };
   }, []);
 
   useEffect(() => {
@@ -203,7 +210,7 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
 
   const sendMessage = async (overrideText?: string) => {
     const text = (overrideText || input).trim();
-    if (!text || engineState.isGenerating) return;
+    if (!text || isGenerating) return;
 
     const userMsg: ExtendedChatMessage = {
       id: Date.now().toString(),
@@ -225,6 +232,7 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
     if (!overrideText) setInput("");
 
     if (engineState.status === "ready") {
+      setIsGenerating(true);
       try {
         const { sources } = await streamRAGCompletion(
           text,
@@ -268,6 +276,8 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
               : m
           )
         );
+      } finally {
+        setIsGenerating(false);
       }
     } else {
       setTimeout(() => {
@@ -308,7 +318,7 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
 
         <select
           value={engineState.selectedModelId}
-          disabled={engineState.status === "loading" || engineState.isGenerating}
+          disabled={engineState.status === "loading" || isGenerating}
           onChange={(e) => {
             const newId = e.target.value;
             handleLoadModel(newId);
@@ -393,7 +403,7 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
             style={{ maxHeight: "120px", overflowY: "auto" }}
           />
 
-          {engineState.isGenerating ? (
+          {isGenerating ? (
             <button
               onClick={handleStop}
               className="flex-shrink-0 mb-0.5 px-3 py-1.5 rounded-lg flex items-center gap-1 text-[11px] font-semibold btn-cyber-stop text-white transition-all"

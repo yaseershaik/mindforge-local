@@ -244,7 +244,7 @@ export default function KnowledgeMesh({
               >
                 <div className="flex items-center justify-between text-[10px] font-mono">
                   <span className="text-cyan-400 font-semibold">
-                    Chunk #${chunk.index + 1}
+                    {`Chunk #${chunk.index + 1}`}
                   </span>
                 </div>
                 <p className="text-[11px] text-slate-300 leading-relaxed line-clamp-3">

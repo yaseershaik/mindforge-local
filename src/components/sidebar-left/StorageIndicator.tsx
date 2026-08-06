@@ -1,134 +1,73 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
-import { Database, Trash2, Cpu } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Database, Trash2 } from "lucide-react";
 import { getVectorCount, subscribeVectorStore } from "@/lib/vectorStore";
-import type { StorageEstimate } from "@/types";
 
 interface StorageIndicatorProps {
   onClearStorage?: () => void;
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
-  return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
-}
-
 export default function StorageIndicator({ onClearStorage }: StorageIndicatorProps) {
-  const [storage, setStorage] = useState<StorageEstimate | null>(null);
   const [vectorCount, setVectorCount] = useState<number>(0);
-  const [isClearing, setIsClearing] = useState(false);
-
-  const fetchStorage = useCallback(async () => {
-    if (navigator.storage?.estimate) {
-      const est = await navigator.storage.estimate();
-      const usage = est.usage ?? 0;
-      const quota = est.quota ?? 1;
-      setStorage({
-        usageBytes: usage,
-        quotaBytes: quota,
-        usagePercent: Math.min((usage / quota) * 100, 100),
-      });
-    }
-
-    const count = await getVectorCount();
-    setVectorCount(count);
-  }, []);
+  const [storageInfo, setStorageInfo] = useState<{ usedMB: number; quotaMB: number } | null>(null);
 
   useEffect(() => {
-    fetchStorage();
-    const unsubscribe = subscribeVectorStore(() => {
-      fetchStorage();
-    });
-    const intervalId = setInterval(fetchStorage, 8_000);
-    return () => {
-      unsubscribe();
-      clearInterval(intervalId);
-    };
-  }, [fetchStorage]);
+    // Subscribe to real-time vector count updates
+    const unsubscribe = subscribeVectorStore((count) => setVectorCount(count));
+    getVectorCount().then((count) => setVectorCount(count));
 
-  const handleClear = async () => {
-    if (isClearing) return;
-    setIsClearing(true);
-    try {
-      if (onClearStorage) {
-        await onClearStorage();
-      }
-      await fetchStorage();
-    } finally {
-      setIsClearing(false);
+    // Check browser IndexedDB / OPFS storage quota using native browser API
+    if (typeof window !== "undefined" && navigator.storage && navigator.storage.estimate) {
+      navigator.storage.estimate().then((estimate: StorageEstimate) => {
+        const usage = estimate.usage || 0;
+        const quota = estimate.quota || 1;
+        setStorageInfo({
+          usedMB: Math.round(usage / (1024 * 1024)),
+          quotaMB: Math.round(quota / (1024 * 1024)),
+        });
+      }).catch(() => {});
     }
-  };
 
-  const pct = storage?.usagePercent ?? 0;
-  const barColor = pct > 80 ? "#f43f5e" : pct > 50 ? "#f59e0b" : "#6366f1";
+    return () => unsubscribe();
+  }, []);
 
   return (
     <div className="space-y-2.5">
-      {/* Header row */}
-      <div className="flex items-center gap-1.5 justify-between">
-        <div className="flex items-center gap-1.5">
-          <Database className="w-3 h-3" style={{ color: "#6366f1" }} />
-          <span
-            className="text-[10px] font-semibold tracking-[0.1em] uppercase"
-            style={{ color: "#475569" }}
-          >
-            IndexedDB / Vector DB
-          </span>
-        </div>
-        <span className="text-[10px] font-mono" style={{ color: "#94a3b8" }}>
-          {storage ? pct.toFixed(1) : "--"}%
+      <div className="flex items-center justify-between text-[10px] font-mono">
+        <span className="flex items-center gap-1.5 text-slate-400 font-bold uppercase tracking-wider">
+          <Database className="w-3.5 h-3.5 text-cyan-400" /> Vector Index
+        </span>
+        <span className="text-cyan-400 font-bold">
+          {vectorCount} {vectorCount === 1 ? "Chunk" : "Chunks"}
         </span>
       </div>
 
-      {/* Usage Bar */}
-      <div
-        className="relative w-full h-1.5 rounded-full overflow-hidden"
-        style={{ background: "rgba(255,255,255,0.05)" }}
-      >
-        <div
-          className="absolute inset-y-0 left-0 rounded-full transition-all duration-700"
-          style={{
-            width: storage ? `${pct}%` : "0%",
-            background: `linear-gradient(90deg, ${barColor}99, ${barColor})`,
-            boxShadow: storage ? `0 0 8px ${barColor}66` : "none",
-          }}
-        />
-      </div>
-
-      {/* Vector count & Clear action row */}
-      <div className="flex items-center justify-between pt-0.5">
-        <div className="flex items-center gap-1 text-[10px]" style={{ color: "#818cf8" }}>
-          <Cpu className="w-2.5 h-2.5" />
-          <span className="font-mono font-medium">
-            {vectorCount.toLocaleString()} vector{vectorCount !== 1 ? "s" : ""}
-          </span>
+      {storageInfo && (
+        <div className="space-y-1">
+          <div className="flex justify-between text-[9px] font-mono text-slate-500">
+            <span>Local DB Usage</span>
+            <span>{storageInfo.usedMB} MB / {storageInfo.quotaMB} MB</span>
+          </div>
+          <div className="w-full h-1.5 rounded-full bg-black/40 border border-white/5 overflow-hidden">
+            <div
+              className="h-full rounded-full bg-cyan-400 transition-all duration-300"
+              style={{
+                width: `${Math.min((storageInfo.usedMB / Math.max(storageInfo.quotaMB, 1)) * 100, 100)}%`,
+              }}
+            />
+          </div>
         </div>
+      )}
 
+      {onClearStorage && (
         <button
-          onClick={handleClear}
-          disabled={isClearing}
-          className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-medium transition-all duration-150 hover:bg-red-500/15 disabled:opacity-40"
-          style={{ color: "#f43f5e", border: "1px solid rgba(244,63,94,0.2)" }}
-          title="Clear vector database & IndexedDB storage"
+          onClick={onClearStorage}
+          className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg bg-slate-900 border border-white/10 hover:border-rose-500/30 text-slate-400 hover:text-rose-400 text-[10px] font-medium transition-all"
         >
-          <Trash2 className="w-2.5 h-2.5" />
-          Clear
+          <Trash2 className="w-3 h-3" />
+          Purge Vector Cache
         </button>
-      </div>
-
-      {storage && (
-        <div className="flex justify-between">
-          <span className="text-[9px] font-mono" style={{ color: "#334155" }}>
-            {formatBytes(storage.usageBytes)} used
-          </span>
-          <span className="text-[9px] font-mono" style={{ color: "#334155" }}>
-            {formatBytes(storage.quotaBytes)} quota
-          </span>
-        </div>
       )}
     </div>
   );

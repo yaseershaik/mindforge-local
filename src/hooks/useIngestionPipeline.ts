@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useCallback } from "react";
-import { getWorkerPool, terminateWorkerPool } from "@/lib/workerPool";
-import { getEmbedWorkerPool, terminateEmbedWorkerPool } from "@/lib/embedWorkerPool";
+import { getWorkerPool } from "@/lib/workerPool";
+import { getEmbedWorkerPool } from "@/lib/embedWorkerPool";
 import { insertDocChunks, initVectorStore, savePersistedDocuments, loadPersistedDocuments, clearVectorStore } from "@/lib/vectorStore";
 import type { DocumentMeta, FileItem, WorkerOutMessage, EmbedWorkerOutMessage } from "@/types";
 
@@ -36,8 +36,9 @@ export function useIngestionPipeline(
 
     return () => {
       isMounted = false;
-      terminateWorkerPool();
-      terminateEmbedWorkerPool();
+      // Note: We intentionally do NOT terminate the global singleton worker pools
+      // here. React 18 Strict Mode causes double-mount/unmount cycles which would
+      // kill the shared workers and break any in-flight ingestion jobs.
     };
   }, []);
 
@@ -64,10 +65,11 @@ export function useIngestionPipeline(
                   progress: msg.progress,
                 });
               } else if (msg.type === "done") {
+                const doneChunks = msg.chunks ?? [];
                 update(meta.id, {
                   status: "embedding",
                   progress: 0,
-                  chunkCount: msg.chunks.length,
+                  chunkCount: doneChunks.length,
                   fullText: msg.fullText,
                 });
 
@@ -75,7 +77,7 @@ export function useIngestionPipeline(
                 embedPool.enqueue(
                   embedJobId,
                   meta.id,
-                  msg.chunks,
+                  doneChunks,
                   (embedMsg: EmbedWorkerOutMessage) => {
                     if (embedMsg.type === "embed-progress") {
                       update(meta.id, {

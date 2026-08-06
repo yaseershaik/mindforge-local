@@ -12,15 +12,24 @@ import type { TextChunk, EmbedWorkerTask, EmbedWorkerOutMessage } from "@/types"
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
-let extractorPipeline: any = null;
+let extractorPromise: Promise<any> | null = null;
 
 async function getExtractor() {
-  if (!extractorPipeline) {
+  if (!extractorPromise) {
     console.log("[EmbedWorker] Loading model Xenova/all-MiniLM-L6-v2...");
-    extractorPipeline = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
-    console.log("[EmbedWorker] Model loaded successfully.");
+    extractorPromise = pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2").then(
+      (instance) => {
+        console.log("[EmbedWorker] Model loaded successfully.");
+        return instance;
+      },
+      (err) => {
+        // Reset promise so next attempt can retry
+        extractorPromise = null;
+        throw err;
+      }
+    );
   }
-  return extractorPipeline;
+  return extractorPromise;
 }
 
 function post(msg: EmbedWorkerOutMessage) {

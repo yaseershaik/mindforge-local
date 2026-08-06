@@ -16,9 +16,9 @@ export interface ModelSpec {
 export const SUPPORTED_MODELS: ModelSpec[] = [
   {
     id: "SmolLM2-360M-Instruct-q4f16_1-MLC",
-    name: "SmolLM2 360M (Ultra Fast / Mobile)",
+    name: "SmolLM2 360M (Ultra Fast )",
     vramMB: 376,
-    description: "Ultra-lightweight model optimized for low VRAM and mobile GPUs",
+    description: "Ultra-lightweight model optimized for low VRAM GPUs",
     isRecommended: true,
   },
   {
@@ -96,6 +96,11 @@ export async function loadModelEngine(modelId?: string): Promise<MLCEngine> {
   const targetModelId = modelId || state.selectedModelId;
   
   if (engineInstance && state.selectedModelId !== targetModelId) {
+    try {
+      await engineInstance.unload();
+    } catch {
+      // Best-effort unload — engine may already be disposed
+    }
     engineInstance = null;
   }
   
@@ -299,6 +304,7 @@ ${cleanContext.slice(0, 5000)}`;
   ];
 
   let accumulatedText = "";
+  const localAbortController = currentAbortController;
 
   try {
     const completionStream = await engine.chat.completions.create({
@@ -311,7 +317,7 @@ ${cleanContext.slice(0, 5000)}`;
     });
 
     for await (const chunk of completionStream) {
-      if (currentAbortController?.signal.aborted) {
+      if (localAbortController.signal.aborted) {
         break;
       }
       const delta = chunk.choices[0]?.delta?.content || "";
