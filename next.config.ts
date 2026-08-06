@@ -9,18 +9,7 @@ const nextConfig: NextConfig = {
   // WASM modules (Transformers.js / WebLLM) must stay server-external
   serverExternalPackages: ["@xenova/transformers", "@mlc-ai/web-llm"],
 
-  // Required for SharedArrayBuffer — needed by WebGPU compute pipelines
-  async headers() {
-    return [
-      {
-        source: "/(.*)",
-        headers: [
-          { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
-          { key: "Cross-Origin-Embedder-Policy", value: "credentialless" },
-        ],
-      },
-    ];
-  },
+
 
   webpack(config) {
     // Allow WASM imports (for Transformers.js / WebLLM WASM blobs)

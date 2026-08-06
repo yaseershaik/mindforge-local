@@ -397,9 +397,13 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
         )}
 
         {engineState.status === "error" && (
-          <span className="flex items-center gap-1.5 text-[11px] px-2.5 py-0.5 rounded-full font-medium text-rose-400 bg-rose-500/10 border border-rose-500/30" title={engineState.errorMessage || "Unknown error"}>
-            <AlertTriangle className="w-3 h-3" /> Error Loading
-          </span>
+          <button
+            onClick={() => handleLoadModel()}
+            className="flex items-center gap-1.5 text-[11px] px-2.5 py-0.5 rounded-full font-medium text-rose-400 bg-rose-500/10 border border-rose-500/30 hover:bg-rose-500/20 transition-all cursor-pointer"
+            title={engineState.errorMessage || "Click to retry loading model"}
+          >
+            <AlertTriangle className="w-3 h-3" /> Retry Load
+          </button>
         )}
 
         <button
