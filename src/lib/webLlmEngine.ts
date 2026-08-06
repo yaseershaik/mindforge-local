@@ -276,7 +276,7 @@ export async function streamRAGCompletion(
     try {
       const queryVector = await generatePromptEmbedding(userPrompt);
       if (queryVector) {
-        sources = await searchVector(queryVector, 5);
+        sources = await searchVector(queryVector, 3);
       }
     } catch (err) {
       console.warn("[WebLLMEngine] Vector search fallback triggered:", err);
@@ -304,19 +304,17 @@ export async function streamRAGCompletion(
 
   const cleanContext = deduplicateContextText(contextText);
 
-  // High-capacity, detailed instruction set
-  const systemMessage = `You are MindForge AI, an expert, highly articulate, and detailed document analysis assistant.
+  // Fast & focused instruction set
+  const systemMessage = `You are MindForge AI, a fast, clear, and direct document analysis assistant.
 Total uploaded files: ${documents.length}.
 
-INSTRUCTIONS FOR DETAILED & HIGH-QUALITY RESPONSES:
-1. Provide comprehensive, in-depth, and well-structured answers based strictly on the provided DOCUMENT CONTEXT.
-2. Structure your response with clear headings, detailed explanations, and bullet points where appropriate.
-3. Be thorough, precise, and informative. Elaborate on key findings, concepts, and actionable insights.
-4. Avoid repeating phrases or getting stuck in repetitive loops.
-5. If the document context does not contain enough information to answer a question, state so clearly while summarizing what is available.
+RESPONSE GUIDELINES:
+1. Provide a direct, high-quality, and well-structured answer based strictly on the DOCUMENT CONTEXT.
+2. Use clear paragraphs and bullet points for speed and readability.
+3. Be informative, accurate, and prompt. Avoid fluff or unnecessary filler.
 
 DOCUMENT CONTEXT:
-${cleanContext.slice(0, 12000)}`;
+${cleanContext.slice(0, 4500)}`;
 
   const messages = [
     { role: "system" as const, content: systemMessage },
@@ -330,10 +328,10 @@ ${cleanContext.slice(0, 12000)}`;
     const completionStream = await engine.chat.completions.create({
       messages,
       stream: true,
-      temperature: 0.2,
+      temperature: 0.1,
       presence_penalty: 0.5,
       frequency_penalty: 0.5,
-      max_tokens: 2048,
+      max_tokens: 1024,
     });
 
     for await (const chunk of completionStream) {
@@ -368,10 +366,10 @@ ${cleanContext.slice(0, 12000)}`;
       const retryStream = await freshEngine.chat.completions.create({
         messages,
         stream: true,
-        temperature: 0.2,
+        temperature: 0.1,
         presence_penalty: 0.5,
         frequency_penalty: 0.5,
-        max_tokens: 2048,
+        max_tokens: 1024,
       });
 
       for await (const chunk of retryStream) {
