@@ -17,11 +17,23 @@ export default function Dashboard() {
   const [isMobileDevice, setIsMobileDevice] = useState(false);
 
   useEffect(() => {
-    const isMobile =
-      /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
-        navigator.userAgent
-      ) || window.innerWidth < 768;
-    setIsMobileDevice(isMobile);
+    const checkMobileHardware = () => {
+      if (typeof window === "undefined") return false;
+
+      const ua = navigator.userAgent || "";
+      const isMobileUA = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile|Tablet/i.test(ua);
+      
+      const navData = (navigator as any).userAgentData;
+      const isMobileData = navData ? navData.mobile : false;
+
+      const hasTouch = "ontouchstart" in window || navigator.maxTouchPoints > 0;
+      const isCoarsePointer = window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
+
+      // Detect mobile hardware even when "Desktop site" mode is toggled
+      return isMobileUA || isMobileData || (hasTouch && isCoarsePointer) || window.innerWidth < 768;
+    };
+
+    setIsMobileDevice(checkMobileHardware());
   }, []);
 
   const updateDocument = useCallback(
