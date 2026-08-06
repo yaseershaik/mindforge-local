@@ -199,11 +199,13 @@ async function generatePromptEmbedding(promptText: string): Promise<number[] | n
   };
 
   return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), 1500); // 1.5s fast fallback timeout
     embedPool.enqueue(
       `embed-prompt-${Date.now()}`,
       "prompt",
       [tempChunk],
       (msg) => {
+        clearTimeout(timer);
         if (msg.type === "embed-done" && msg.chunks[0]?.embedding) {
           resolve(msg.chunks[0].embedding);
         } else {
@@ -309,12 +311,12 @@ export async function streamRAGCompletion(
 Total uploaded files: ${documents.length}.
 
 RESPONSE GUIDELINES:
-1. Provide a direct, high-quality, and well-structured answer based strictly on the DOCUMENT CONTEXT.
-2. Use clear paragraphs and bullet points for speed and readability.
+1. Provide a direct, concise, and well-structured answer based strictly on the DOCUMENT CONTEXT.
+2. Use clear paragraphs and bullet points for maximum speed and readability.
 3. Be informative, accurate, and prompt. Avoid fluff or unnecessary filler.
 
 DOCUMENT CONTEXT:
-${cleanContext.slice(0, 4500)}`;
+${cleanContext.slice(0, 2500)}`;
 
   const messages = [
     { role: "system" as const, content: systemMessage },
@@ -329,9 +331,9 @@ ${cleanContext.slice(0, 4500)}`;
       messages,
       stream: true,
       temperature: 0.1,
-      presence_penalty: 0.5,
-      frequency_penalty: 0.5,
-      max_tokens: 1024,
+      presence_penalty: 0.0,
+      frequency_penalty: 0.0,
+      max_tokens: 600,
     });
 
     for await (const chunk of completionStream) {
@@ -367,9 +369,9 @@ ${cleanContext.slice(0, 4500)}`;
         messages,
         stream: true,
         temperature: 0.1,
-        presence_penalty: 0.5,
-        frequency_penalty: 0.5,
-        max_tokens: 1024,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        max_tokens: 600,
       });
 
       for await (const chunk of retryStream) {
