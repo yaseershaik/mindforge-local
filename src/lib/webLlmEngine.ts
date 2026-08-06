@@ -43,6 +43,8 @@ export const SUPPORTED_MODELS: ModelSpec[] = [
 
 let engineInstance: MLCEngine | null = null;
 let currentAbortController: AbortController | null = null;
+let activeLoadPromise: Promise<MLCEngine> | null = null;
+let activeLoadingModelId: string | null = null;
 
 let state: EngineState = {
   status: "unloaded",
@@ -94,53 +96,71 @@ export async function checkWebGPUSupport(): Promise<{ supported: boolean; messag
 
 export async function loadModelEngine(modelId?: string): Promise<MLCEngine> {
   const targetModelId = modelId || state.selectedModelId;
-  
-  if (engineInstance && state.selectedModelId !== targetModelId) {
-    try {
-      await engineInstance.unload();
-    } catch {
-      // Best-effort unload — engine may already be disposed
-    }
-    engineInstance = null;
+
+  // 1. If engine is already ready with the requested model, return instance
+  if (engineInstance && state.selectedModelId === targetModelId && state.status === "ready") {
+    return engineInstance;
   }
-  
+
+  // 2. If a load for this exact model is currently in flight, return the active load promise
+  if (activeLoadPromise && activeLoadingModelId === targetModelId) {
+    return activeLoadPromise;
+  }
+
+  activeLoadingModelId = targetModelId;
   state.selectedModelId = targetModelId;
 
-  if (engineInstance && state.status === "ready") {
-    return engineInstance;
-  }
+  activeLoadPromise = (async () => {
+    // Unload stale engine if switching models or recovering
+    if (engineInstance) {
+      try {
+        await engineInstance.unload();
+      } catch {
+        // Best-effort unload
+      }
+      engineInstance = null;
+    }
 
-  state.status = "loading";
-  state.progress = 0;
-  state.progressText = "Initializing WebGPU engine…";
-  state.errorMessage = null;
-  notifyStateChange();
+    state.status = "loading";
+    state.progress = 0;
+    state.progressText = "Initializing WebGPU engine…";
+    state.errorMessage = null;
+    notifyStateChange();
 
-  try {
-    const initProgressCallback = (report: InitProgressReport) => {
-      state.progress = Math.round(report.progress * 100);
-      state.progressText = report.text || "Loading model weights…";
+    try {
+      const initProgressCallback = (report: InitProgressReport) => {
+        state.progress = Math.round(report.progress * 100);
+        state.progressText = report.text || "Loading model weights…";
+        notifyStateChange();
+      };
+
+      const newEngine = await CreateMLCEngine(targetModelId, {
+        initProgressCallback,
+      });
+
+      engineInstance = newEngine;
+      state.status = "ready";
+      state.progress = 100;
+      state.progressText = "Model ready";
+      state.errorMessage = null;
       notifyStateChange();
-    };
 
-    engineInstance = await CreateMLCEngine(targetModelId, {
-      initProgressCallback,
-    });
+      return newEngine;
+    } catch (err) {
+      engineInstance = null;
+      const message = err instanceof Error ? err.message : String(err);
+      state.status = "error";
+      state.errorMessage = message;
+      state.progressText = "Failed to load model";
+      notifyStateChange();
+      throw err;
+    } finally {
+      activeLoadPromise = null;
+      activeLoadingModelId = null;
+    }
+  })();
 
-    state.status = "ready";
-    state.progress = 100;
-    state.progressText = "Model ready";
-    notifyStateChange();
-
-    return engineInstance;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    state.status = "error";
-    state.errorMessage = message;
-    state.progressText = "Failed to load model";
-    notifyStateChange();
-    throw err;
-  }
+  return activeLoadPromise;
 }
 
 export async function stopGeneration(): Promise<void> {
@@ -334,7 +354,35 @@ ${cleanContext.slice(0, 5000)}`;
       }
     }
   } catch (err) {
-    if ((err as Error)?.name !== "AbortError") {
+    const errStr = String(err);
+    if (errStr.includes("disposed") || errStr.includes("Model not loaded")) {
+      console.warn("[WebLLM] Detected disposed engine instance. Auto-recovering...", err);
+      engineInstance = null;
+      state.status = "unloaded";
+      notifyStateChange();
+
+      // Auto-recover: reload fresh engine and retry chat completion once
+      const freshEngine = await loadModelEngine(state.selectedModelId);
+      await freshEngine.resetChat();
+
+      const retryStream = await freshEngine.chat.completions.create({
+        messages,
+        stream: true,
+        temperature: 0.0,
+        presence_penalty: 1.2,
+        frequency_penalty: 1.2,
+        max_tokens: 900,
+      });
+
+      for await (const chunk of retryStream) {
+        if (localAbortController.signal.aborted) break;
+        const delta = chunk.choices[0]?.delta?.content || "";
+        if (delta) {
+          accumulatedText += delta;
+          onToken(delta, accumulatedText);
+        }
+      }
+    } else if ((err as Error)?.name !== "AbortError") {
       throw err;
     }
   } finally {
