@@ -168,8 +168,35 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
     progressText: "",
     errorMessage: null,
   });
+  const [isHardwareSupported, setIsHardwareSupported] = useState<boolean | null>(null);
 
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+      navigator.userAgent
+    ) || window.innerWidth < 768;
+
+    const checkSupport = async () => {
+      // 1. Check for WebGPU
+      if (!navigator.gpu) {
+        setIsHardwareSupported(false);
+        return;
+      }
+      
+      // 2. Check for sufficient RAM on mobile
+      if (isMobile) {
+        const deviceMemory = (navigator as any).deviceMemory || 4;
+        if (deviceMemory < 4) {
+          setIsHardwareSupported(false);
+          return;
+        }
+      }
+      
+      setIsHardwareSupported(true);
+    };
+    checkSupport();
+  }, []);
 
   useEffect(() => {
     if (initialPrompt) {
@@ -306,6 +333,21 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
       sendMessage();
     }
   };
+
+  if (isHardwareSupported === false) {
+    return (
+      <div className="flex flex-col h-full bg-[#030712] items-center justify-center p-6 text-center space-y-4">
+        <AlertTriangle className="w-12 h-12 text-rose-500 opacity-80" />
+        <h2 className="text-sm font-bold uppercase tracking-widest text-slate-200">
+          Hardware Not Supported
+        </h2>
+        <p className="text-xs text-slate-400 max-w-sm leading-relaxed">
+          Your device hardware does not support WebGPU or lacks the required RAM to run AI models locally. 
+          Please try again on a capable desktop browser (Chrome/Edge/Brave).
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-full bg-[#030712]">
