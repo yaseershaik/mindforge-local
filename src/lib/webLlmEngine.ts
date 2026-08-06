@@ -276,7 +276,7 @@ export async function streamRAGCompletion(
     try {
       const queryVector = await generatePromptEmbedding(userPrompt);
       if (queryVector) {
-        sources = await searchVector(queryVector, 3);
+        sources = await searchVector(queryVector, 5);
       }
     } catch (err) {
       console.warn("[WebLLMEngine] Vector search fallback triggered:", err);
@@ -304,19 +304,19 @@ export async function streamRAGCompletion(
 
   const cleanContext = deduplicateContextText(contextText);
 
-  // Strict anti-loop instruction set
-  const systemMessage = `You are a concise document AI assistant.
+  // High-capacity, detailed instruction set
+  const systemMessage = `You are MindForge AI, an expert, highly articulate, and detailed document analysis assistant.
 Total uploaded files: ${documents.length}.
 
-STRICT FORMATTING RULES:
-1. Provide a clean summary in 3 to 4 sentences.
-2. If asked for topics, list at most 5 main bullet points using hyphen (-) bullets.
-3. DO NOT use numbered lists (1, 2, 3...) to prevent infinite counting loops.
-4. DO NOT repeat the same topic or phrase twice.
-5. Stop generating immediately after providing the bullet points.
+INSTRUCTIONS FOR DETAILED & HIGH-QUALITY RESPONSES:
+1. Provide comprehensive, in-depth, and well-structured answers based strictly on the provided DOCUMENT CONTEXT.
+2. Structure your response with clear headings, detailed explanations, and bullet points where appropriate.
+3. Be thorough, precise, and informative. Elaborate on key findings, concepts, and actionable insights.
+4. Avoid repeating phrases or getting stuck in repetitive loops.
+5. If the document context does not contain enough information to answer a question, state so clearly while summarizing what is available.
 
 DOCUMENT CONTEXT:
-${cleanContext.slice(0, 5000)}`;
+${cleanContext.slice(0, 12000)}`;
 
   const messages = [
     { role: "system" as const, content: systemMessage },
@@ -330,10 +330,10 @@ ${cleanContext.slice(0, 5000)}`;
     const completionStream = await engine.chat.completions.create({
       messages,
       stream: true,
-      temperature: 0.0,
-      presence_penalty: 1.2,  // Strong penalty against generating repeated token loops
-      frequency_penalty: 1.2, // Strong penalty against repeating phrasing
-      max_tokens: 900,        // Cap length to prevent infinite lists
+      temperature: 0.2,
+      presence_penalty: 0.5,
+      frequency_penalty: 0.5,
+      max_tokens: 2048,
     });
 
     for await (const chunk of completionStream) {
@@ -368,10 +368,10 @@ ${cleanContext.slice(0, 5000)}`;
       const retryStream = await freshEngine.chat.completions.create({
         messages,
         stream: true,
-        temperature: 0.0,
-        presence_penalty: 1.2,
-        frequency_penalty: 1.2,
-        max_tokens: 900,
+        temperature: 0.2,
+        presence_penalty: 0.5,
+        frequency_penalty: 0.5,
+        max_tokens: 2048,
       });
 
       for await (const chunk of retryStream) {
