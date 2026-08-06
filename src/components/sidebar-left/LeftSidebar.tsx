@@ -20,7 +20,7 @@ export default function LeftSidebar({
   onClearStorage,
 }: LeftSidebarProps) {
   return (
-    <aside className="w-[260px] flex-shrink-0 flex flex-col h-full overflow-hidden cyber-panel border-r border-indigo-500/20 bg-[#070a12]">
+    <aside className="w-full md:w-[260px] flex-shrink-0 flex flex-col h-full overflow-hidden cyber-panel border-r border-indigo-500/20 bg-[#070a12]">
       {/* Brand Header */}
       <div className="flex items-center gap-3 px-4 py-4 flex-shrink-0 border-b border-indigo-500/15">
         <div className="w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0 btn-cyber-primary">

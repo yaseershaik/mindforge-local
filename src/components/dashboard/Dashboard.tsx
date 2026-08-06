@@ -1,18 +1,19 @@
 "use client";
 
 import LeftSidebar from "@/components/sidebar-left/LeftSidebar";
-import CenterView from "@/components/center/CenterView";
+import CenterView, { type Tab } from "@/components/center/CenterView";
 import RightSidebar from "@/components/sidebar-right/RightSidebar";
 import { useState, useCallback } from "react";
 import { useIngestionPipeline } from "@/hooks/useIngestionPipeline";
 import { removeDocChunks, savePersistedDocuments } from "@/lib/vectorStore";
 import type { DocumentMeta, FileItem } from "@/types";
-import { Menu, X, Cpu } from "lucide-react";
+import { FolderOpen, Network, MessageSquareText, Cpu } from "lucide-react";
 
 export default function Dashboard() {
   const [documents, setDocuments] = useState<DocumentMeta[]>([]);
   const [isMobileLeftOpen, setIsMobileLeftOpen] = useState(false);
   const [isMobileRightOpen, setIsMobileRightOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<Tab>("mesh");
 
   const updateDocument = useCallback(
     (id: string, patch: Partial<DocumentMeta>) => {
@@ -62,25 +63,11 @@ export default function Dashboard() {
 
   return (
     <div className="flex flex-col md:flex-row h-screen w-full overflow-hidden bg-forge-void relative">
-      {/* Mobile Top Header */}
-      <div className="md:hidden flex items-center justify-between px-4 py-2.5 bg-slate-900 border-b border-indigo-500/20 z-20">
-        <button
-          onClick={() => setIsMobileLeftOpen(!isMobileLeftOpen)}
-          className="p-1.5 rounded-lg bg-slate-800 text-slate-300"
-        >
-          {isMobileLeftOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
-        </button>
-
-        <span className="text-xs font-bold uppercase tracking-wider text-cyan-400">
+      {/* Mobile Top Header (Branding Only) */}
+      <div className="md:hidden flex items-center justify-center px-4 py-3 bg-slate-900 border-b border-indigo-500/20 z-20 shadow-sm">
+        <span className="text-[13px] font-extrabold uppercase tracking-widest text-gradient-bold">
           MindForge Local
         </span>
-
-        <button
-          onClick={() => setIsMobileRightOpen(!isMobileRightOpen)}
-          className="p-1.5 rounded-lg bg-slate-800 text-indigo-400"
-        >
-          <Cpu className="w-5 h-5" />
-        </button>
       </div>
 
       {/* Left Sidebar Drawer */}
@@ -101,13 +88,13 @@ export default function Dashboard() {
       {isMobileLeftOpen && (
         <div
           onClick={() => setIsMobileLeftOpen(false)}
-          className="fixed inset-0 bg-black/60 z-20 md:hidden"
+          className="fixed inset-0 bg-black/70 backdrop-blur-sm z-20 md:hidden transition-opacity"
         />
       )}
 
       {/* Center View Window */}
       <main className="flex-1 flex flex-col min-w-0 overflow-hidden relative z-10">
-        <CenterView documents={documents} />
+        <CenterView documents={documents} activeTab={activeTab} setActiveTab={setActiveTab} />
       </main>
 
       {/* Right Sidebar Hardware Diagnostics Drawer */}
@@ -123,9 +110,70 @@ export default function Dashboard() {
       {isMobileRightOpen && (
         <div
           onClick={() => setIsMobileRightOpen(false)}
-          className="fixed inset-0 bg-black/60 z-20 md:hidden"
+          className="fixed inset-0 bg-black/70 backdrop-blur-sm z-20 md:hidden transition-opacity"
         />
       )}
+
+      {/* Mobile Bottom Navigation Bar */}
+      <div className="md:hidden flex items-center justify-around bg-slate-900 border-t border-indigo-500/20 pb-4 pt-2 px-2 z-40 shadow-[0_-4px_20px_rgba(0,0,0,0.3)]">
+        <button
+          onClick={() => {
+            setIsMobileLeftOpen(true);
+            setIsMobileRightOpen(false);
+          }}
+          className={`flex flex-col items-center gap-1 p-2 transition-colors ${
+            isMobileLeftOpen ? "text-cyan-400" : "text-slate-400 hover:text-slate-300"
+          }`}
+        >
+          <FolderOpen className="w-5 h-5" />
+          <span className="text-[10px] font-semibold tracking-wide">Docs</span>
+        </button>
+
+        <button
+          onClick={() => {
+            setActiveTab("mesh");
+            setIsMobileLeftOpen(false);
+            setIsMobileRightOpen(false);
+          }}
+          className={`flex flex-col items-center gap-1 p-2 transition-colors ${
+            !isMobileLeftOpen && !isMobileRightOpen && activeTab === "mesh"
+              ? "text-cyan-400"
+              : "text-slate-400 hover:text-slate-300"
+          }`}
+        >
+          <Network className="w-5 h-5" />
+          <span className="text-[10px] font-semibold tracking-wide">Mesh</span>
+        </button>
+
+        <button
+          onClick={() => {
+            setActiveTab("chat");
+            setIsMobileLeftOpen(false);
+            setIsMobileRightOpen(false);
+          }}
+          className={`flex flex-col items-center gap-1 p-2 transition-colors ${
+            !isMobileLeftOpen && !isMobileRightOpen && activeTab === "chat"
+              ? "text-cyan-400"
+              : "text-slate-400 hover:text-slate-300"
+          }`}
+        >
+          <MessageSquareText className="w-5 h-5" />
+          <span className="text-[10px] font-semibold tracking-wide">Chat</span>
+        </button>
+
+        <button
+          onClick={() => {
+            setIsMobileRightOpen(true);
+            setIsMobileLeftOpen(false);
+          }}
+          className={`flex flex-col items-center gap-1 p-2 transition-colors ${
+            isMobileRightOpen ? "text-cyan-400" : "text-slate-400 hover:text-slate-300"
+          }`}
+        >
+          <Cpu className="w-5 h-5" />
+          <span className="text-[10px] font-semibold tracking-wide">System</span>
+        </button>
+      </div>
     </div>
   );
 }

@@ -6,20 +6,21 @@ import KnowledgeMesh from "./KnowledgeMesh";
 import AgentChat from "./AgentChat";
 import type { DocumentMeta } from "@/types";
 
-type Tab = "mesh" | "chat";
+export type Tab = "mesh" | "chat";
 
 interface CenterViewProps {
   documents: DocumentMeta[];
+  activeTab: Tab;
+  setActiveTab: (tab: Tab) => void;
 }
 
-export default function CenterView({ documents }: CenterViewProps) {
-  const [activeTab, setActiveTab] = useState<Tab>("mesh");
+export default function CenterView({ documents, activeTab, setActiveTab }: CenterViewProps) {
   const [conceptPrompt, setConceptPrompt] = useState<string>("");
 
   const handleSelectConceptPrompt = useCallback((promptText: string) => {
     setConceptPrompt(promptText);
     setActiveTab("chat");
-  }, []);
+  }, [setActiveTab]);
 
   return (
     <div className="flex flex-col h-full overflow-hidden" style={{ background: "#070a12" }}>
@@ -28,9 +29,9 @@ export default function CenterView({ documents }: CenterViewProps) {
         className="flex items-center gap-2 px-6 py-3 flex-shrink-0"
         style={{ borderBottom: "1px solid rgba(99,102,241,0.08)" }}
       >
-        {/* Tab Switcher */}
+        {/* Tab Switcher - Hidden on Mobile */}
         <div
-          className="flex items-center gap-1 p-1 rounded-xl"
+          className="hidden md:flex items-center gap-1 p-1 rounded-xl"
           style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.06)" }}
         >
           <button

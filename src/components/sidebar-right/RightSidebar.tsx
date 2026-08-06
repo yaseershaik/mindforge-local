@@ -5,7 +5,7 @@ import { Activity } from "lucide-react";
 
 export default function RightSidebar() {
   return (
-    <aside className="w-[300px] flex-shrink-0 flex flex-col h-full overflow-hidden cyber-panel border-l border-indigo-500/20 bg-[#070a12]">
+    <aside className="w-full md:w-[300px] flex-shrink-0 flex flex-col h-full overflow-hidden cyber-panel border-l border-indigo-500/20 bg-[#070a12]">
       {/* Header */}
       <div className="flex items-center gap-2.5 px-4 py-4 flex-shrink-0 border-b border-indigo-500/15">
         <Activity className="w-4 h-4 text-cyan-400 animate-pulse" />
