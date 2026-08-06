@@ -279,7 +279,8 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
                   : m
               )
             );
-          }
+          },
+          messages
         );
 
         setMessages((prev) =>

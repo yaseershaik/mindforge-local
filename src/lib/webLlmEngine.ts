@@ -1,7 +1,7 @@
 import { CreateMLCEngine, type MLCEngine, type InitProgressReport } from "@mlc-ai/web-llm";
 import { searchVector } from "./vectorStore";
 import { getEmbedWorkerPool } from "./embedWorkerPool";
-import type { TextChunk, VectorSearchResult, DocumentMeta, EngineState } from "@/types";
+import type { TextChunk, VectorSearchResult, DocumentMeta, EngineState, ChatMessage } from "@/types";
 
 export type { EngineState };
 
@@ -261,7 +261,8 @@ function deduplicateContextText(rawText: string): string {
 export async function streamRAGCompletion(
   userPrompt: string,
   documents: DocumentMeta[],
-  onToken: (token: string, accumulated: string) => void
+  onToken: (token: string, accumulated: string) => void,
+  chatHistory?: ChatMessage[]
 ): Promise<{ text: string; sources: VectorSearchResult[] }> {
   const safetyRefusal = checkSafetyFirewall(userPrompt);
   if (safetyRefusal) {
@@ -339,8 +340,23 @@ RULES FOR CLEAN & ELEGANT RESPONSES:
 DOCUMENT CONTEXT:
 ${cleanContext.slice(0, 3500)}`;
 
+  const historyMessages = (chatHistory || [])
+    .filter(
+      (m) =>
+        m.id !== "welcome" &&
+        m.content &&
+        m.content.trim().length > 0 &&
+        !m.isStreaming
+    )
+    .slice(-4)
+    .map((m) => ({
+      role: (m.role === "assistant" ? "assistant" : "user") as "user" | "assistant",
+      content: m.content.slice(0, 450),
+    }));
+
   const messages = [
     { role: "system" as const, content: systemMessage },
+    ...historyMessages,
     { role: "user" as const, content: userPrompt },
   ];
 
