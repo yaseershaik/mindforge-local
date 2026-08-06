@@ -9,31 +9,56 @@ import { removeDocChunks, savePersistedDocuments } from "@/lib/vectorStore";
 import type { DocumentMeta, FileItem } from "@/types";
 import { FolderOpen, Network, MessageSquareText, Cpu, Brain, Monitor } from "lucide-react";
 
+function checkIsMobileHardware(): boolean {
+  if (typeof window === "undefined") return false;
+
+  const ua = navigator.userAgent || "";
+  const platform = navigator.platform || "";
+
+  // 1. Standard Mobile UA match
+  if (/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile|Tablet/i.test(ua)) {
+    return true;
+  }
+
+  // 2. UserAgentData mobile flag
+  const navData = (navigator as any).userAgentData;
+  if (navData && navData.mobile) {
+    return true;
+  }
+
+  // 3. iOS (iPhone/iPad) in Desktop Site mode:
+  // Reports platform "MacIntel", but maxTouchPoints > 1 (real Macs have 0 touch points)
+  if (platform === "MacIntel" && navigator.maxTouchPoints > 1) {
+    return true;
+  }
+
+  // 4. Android in Desktop Site mode:
+  // Reports X11/Linux, but maxTouchPoints > 0 AND touch events exist
+  if (navigator.maxTouchPoints > 0 && ("ontouchstart" in window || "TouchEvent" in window)) {
+    const isArm = /arm|aarch64/i.test(platform);
+    const minScreenDim = Math.min(window.screen.width, window.screen.height);
+    if (isArm || minScreenDim < 1024 || /Android/i.test(ua)) {
+      return true;
+    }
+  }
+
+  // 5. Fallback for narrow viewports
+  if (window.innerWidth < 768) {
+    return true;
+  }
+
+  return false;
+}
+
 export default function Dashboard() {
   const [documents, setDocuments] = useState<DocumentMeta[]>([]);
   const [isMobileLeftOpen, setIsMobileLeftOpen] = useState(false);
   const [isMobileRightOpen, setIsMobileRightOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>("mesh");
-  const [isMobileDevice, setIsMobileDevice] = useState(false);
+  const [isMobileDevice, setIsMobileDevice] = useState<boolean>(() => checkIsMobileHardware());
 
   useEffect(() => {
-    const checkMobileHardware = () => {
-      if (typeof window === "undefined") return false;
-
-      const ua = navigator.userAgent || "";
-      const isMobileUA = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile|Tablet/i.test(ua);
-      
-      const navData = (navigator as any).userAgentData;
-      const isMobileData = navData ? navData.mobile : false;
-
-      const hasTouch = "ontouchstart" in window || navigator.maxTouchPoints > 0;
-      const isCoarsePointer = window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
-
-      // Detect mobile hardware even when "Desktop site" mode is toggled
-      return isMobileUA || isMobileData || (hasTouch && isCoarsePointer) || window.innerWidth < 768;
-    };
-
-    setIsMobileDevice(checkMobileHardware());
+    setIsMobileDevice(checkIsMobileHardware());
   }, []);
 
   const updateDocument = useCallback(
