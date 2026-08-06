@@ -91,7 +91,9 @@ function MessageBubble({
           {msg.isStreaming && (
             <span className="inline-flex items-center gap-1.5 text-cyan-400 font-mono text-[11px] ml-2">
               <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping inline-block" />
-              <span className="animate-pulse">Generating response...</span>
+              {(!msg.content || msg.content.trim().length === 0) && (
+                <span className="animate-pulse">Generating response...</span>
+              )}
             </span>
           )}
         </div>
@@ -459,10 +461,10 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
           {isGenerating ? (
             <button
               onClick={handleStop}
-              className="flex-shrink-0 mb-0.5 px-3 py-1.5 rounded-lg flex items-center gap-1 text-[11px] font-semibold btn-cyber-stop text-white transition-all"
+              className="flex-shrink-0 mb-0.5 w-7 h-7 rounded-lg flex items-center justify-center btn-cyber-stop text-white transition-all"
+              title="Stop generation"
             >
               <Square className="w-3.5 h-3.5 fill-current" />
-              Stop
             </button>
           ) : (
             <button
