@@ -177,6 +177,13 @@ export default function HardwareDiagnostics() {
       ? CheckCircle2
       : XCircle;
 
+  const webgpuTitle = {
+    checking: "Probing WebGPU Context…",
+    supported: "WebGPU Engine Active",
+    unsupported: "WebGPU Unsupported",
+    error: "WebGPU Probe Error",
+  }[hw.webgpuStatus];
+
   return (
     <div className="space-y-4 animate-fade-in-up">
       {/* WebGPU Status Banner */}
@@ -199,7 +206,7 @@ export default function HardwareDiagnostics() {
               className="text-xs font-bold uppercase tracking-wider"
               style={{ color: statusColor }}
             >
-              {hw.webgpuStatus === "supported" ? "WebGPU Engine Active" : "WebGPU Probe"}
+              {webgpuTitle}
             </span>
           </div>
           <span className="text-[9px] font-mono px-2 py-0.5 rounded bg-black/40 border border-white/10 text-slate-400">
@@ -207,13 +214,17 @@ export default function HardwareDiagnostics() {
           </span>
         </div>
 
-        {hw.adapterInfo && (
+        {hw.adapterInfo ? (
           <p className="text-[11px] font-medium text-slate-300 truncate">
             {hw.adapterInfo.description !== "WebGPU Execution Context"
               ? hw.adapterInfo.description
               : hw.adapterInfo.vendor}
           </p>
-        )}
+        ) : hw.webgpuStatus === "unsupported" ? (
+          <p className="text-[10px] font-medium text-rose-300">
+            WebGPU is not enabled in this browser. Use Chrome 113+ or Edge 113+.
+          </p>
+        ) : null}
       </div>
 
       {/* Model Loader & VRAM Allocation Control */}
