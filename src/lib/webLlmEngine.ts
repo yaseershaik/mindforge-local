@@ -216,6 +216,26 @@ async function generatePromptEmbedding(promptText: string): Promise<number[] | n
   });
 }
 
+/** Anti-repetition loop detector for small LLMs */
+function checkRepetitiveLoop(text: string): boolean {
+  if (text.length < 30) return false;
+  const lastChunk = text.slice(-150);
+  const words = lastChunk.split(/\s+/).filter(Boolean);
+  if (words.length >= 6) {
+    const last3 = words.slice(-3).join(" ");
+    const prev3 = words.slice(-6, -3).join(" ");
+    const prevPrev3 = words.slice(-9, -6).join(" ");
+    if (
+      last3.length > 4 &&
+      last3.toLowerCase() === prev3.toLowerCase() &&
+      prev3.toLowerCase() === prevPrev3.toLowerCase()
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Clean context by removing duplicate sentences and repetitive header noise */
 function deduplicateContextText(rawText: string): string {
   const lines = rawText.split("\n");
@@ -306,17 +326,18 @@ export async function streamRAGCompletion(
 
   const cleanContext = deduplicateContextText(contextText);
 
-  // Fast & focused instruction set
-  const systemMessage = `You are MindForge AI, a fast, clear, and direct document analysis assistant.
+  // Clean & elegant instruction set
+  const systemMessage = `You are MindForge AI, a clean, professional, and precise document analysis assistant.
 Total uploaded files: ${documents.length}.
 
-RESPONSE GUIDELINES:
-1. Provide a direct, concise, and well-structured answer based strictly on the DOCUMENT CONTEXT.
-2. Use clear paragraphs and bullet points for maximum speed and readability.
-3. Be informative, accurate, and prompt. Avoid fluff or unnecessary filler.
+RULES FOR CLEAN & ELEGANT RESPONSES:
+1. Provide a direct, well-formatted answer based strictly on the DOCUMENT CONTEXT.
+2. Use clean bullet points and clear paragraphs.
+3. NEVER repeat the same phrase, heading, or line multiple times.
+4. Stop generating cleanly once the answer is complete.
 
 DOCUMENT CONTEXT:
-${cleanContext.slice(0, 2500)}`;
+${cleanContext.slice(0, 3500)}`;
 
   const messages = [
     { role: "system" as const, content: systemMessage },
@@ -330,9 +351,9 @@ ${cleanContext.slice(0, 2500)}`;
     const completionStream = await engine.chat.completions.create({
       messages,
       stream: true,
-      temperature: 0.1,
-      presence_penalty: 0.0,
-      frequency_penalty: 0.0,
+      temperature: 0.3,
+      presence_penalty: 0.5,
+      frequency_penalty: 0.8,
       max_tokens: 600,
     });
 
@@ -344,8 +365,8 @@ ${cleanContext.slice(0, 2500)}`;
       if (delta) {
         accumulatedText += delta;
         
-        // Post-processing guardrail: stop if model starts outputting repetitive list numbers > 6
-        if (/([6-9]|10|11|12)\.\s/.test(accumulatedText)) {
+        // Anti-repetition guardrail: stop immediately if phrase loop is detected
+        if (checkRepetitiveLoop(accumulatedText) || /([6-9]|10|11|12)\.\s/.test(accumulatedText)) {
           await stopGeneration();
           break;
         }
@@ -368,9 +389,9 @@ ${cleanContext.slice(0, 2500)}`;
       const retryStream = await freshEngine.chat.completions.create({
         messages,
         stream: true,
-        temperature: 0.1,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
+        temperature: 0.3,
+        presence_penalty: 0.5,
+        frequency_penalty: 0.8,
         max_tokens: 600,
       });
 
