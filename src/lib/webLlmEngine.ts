@@ -236,6 +236,30 @@ function checkRepetitiveLoop(text: string): boolean {
   return false;
 }
 
+/** Clean up trailing orphan list numbers and ensure clean sentence endings */
+export function sanitizeCleanEnding(rawText: string): string {
+  let text = rawText.trimEnd();
+
+  // 1. Remove hanging orphan list numbers at the very end like "6.", "6. ", "7.", "\n6.", "\n6. "
+  text = text.replace(/(?:\r?\n|^)\s*\d+\.\s*$/, "");
+
+  // 2. If the text ends mid-sentence without terminal punctuation (. ! ?), trim back to last completed sentence
+  const trimmed = text.trim();
+  if (trimmed.length > 50 && !/[.!?]$/.test(trimmed)) {
+    const lastPeriodIndex = Math.max(
+      trimmed.lastIndexOf("."),
+      trimmed.lastIndexOf("!"),
+      trimmed.lastIndexOf("?")
+    );
+    if (lastPeriodIndex > trimmed.length - 180) {
+      text = trimmed.substring(0, lastPeriodIndex + 1);
+    }
+  }
+
+  // Remove any trailing orphan list numbers again after trimming
+  return text.trim().replace(/(?:\r?\n|^)\s*\d+\.\s*$/, "");
+}
+
 /** Clean context by removing duplicate sentences and repetitive header noise */
 function deduplicateContextText(rawText: string): string {
   const lines = rawText.split("\n");
@@ -363,6 +387,10 @@ ${cleanContext.slice(0, 3500)}`;
   let accumulatedText = "";
   const localAbortController = currentAbortController;
 
+  if (localAbortController?.signal.aborted) {
+    return { text: "🛑 Generation stopped.", sources };
+  }
+
   try {
     const completionStream = await engine.chat.completions.create({
       messages,
@@ -382,7 +410,7 @@ ${cleanContext.slice(0, 3500)}`;
         accumulatedText += delta;
         
         // Anti-repetition guardrail: stop immediately if phrase loop is detected
-        if (checkRepetitiveLoop(accumulatedText) || /([6-9]|10|11|12)\.\s/.test(accumulatedText)) {
+        if (checkRepetitiveLoop(accumulatedText)) {
           await stopGeneration();
           break;
         }
@@ -428,5 +456,6 @@ ${cleanContext.slice(0, 3500)}`;
     notifyStateChange();
   }
 
-  return { text: accumulatedText, sources };
+  const cleanedText = sanitizeCleanEnding(accumulatedText);
+  return { text: cleanedText, sources };
 }

@@ -228,6 +228,18 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
 
   const handleStop = async () => {
     await stopGeneration();
+    setIsGenerating(false);
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.isStreaming
+          ? {
+              ...m,
+              isStreaming: false,
+              content: m.content && m.content.trim().length > 0 ? m.content : "🛑 Generation stopped.",
+            }
+          : m
+      )
+    );
   };
 
   const handleClearAllChat = () => {
@@ -264,7 +276,7 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
     if (engineState.status === "ready") {
       setIsGenerating(true);
       try {
-        const { sources } = await streamRAGCompletion(
+        const { text, sources } = await streamRAGCompletion(
           text,
           documents,
           (_token, accumulated) => {
@@ -288,6 +300,7 @@ export default function AgentChat({ documents, initialPrompt }: AgentChatProps) 
             m.id === thinkingId
               ? {
                   ...m,
+                  content: text || m.content,
                   isStreaming: false,
                   searchResults: sources,
                 }
